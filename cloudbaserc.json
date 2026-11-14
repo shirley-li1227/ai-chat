@@ -30,13 +30,14 @@
         "NODE_ENV": "production",
         "PORT": "9000",
         "CORS_ORIGINS": "",
-        "DB_TYPE": "postgres",
+        "DB_TYPE": "sqljs",
         "DB_SYNCHRONIZE": "true",
-        "DB_HOST": "REPLACE_WITH_TENCENTDB_INTERNAL_HOST",
+        "DB_HOST": "REPLACE_WITH_PG_ADDRESS",
         "DB_PORT": "5432",
-        "DB_USERNAME": "REPLACE_WITH_DB_USERNAME",
+        "DB_USERNAME": "REPLACE_WITH_PG_DIRECT_USER",
         "DB_PASSWORD": "{{env.DB_PASSWORD}}",
-        "DB_DATABASE": "ai_chat",
+        "DB_DATABASE": "postgres-of2f87eo",
+        "DB_SSL": "false",
         "ENCRYPTION_KEY": "{{env.ENCRYPTION_KEY}}",
         "AGENT_MAX_TURNS": "6",
         "THROTTLE_TTL": "60000",
@@ -44,10 +45,6 @@
         "FETCH_TIMEOUT_MS": "15000",
         "FETCH_MAX_BYTES": "1048576",
         "FETCH_ALLOWED_HOSTS": ""
-      },
-      "vpc": {
-        "vpcId": "vpc-217l0h9i",
-        "subnetId": "subnet-2tyjn5r3"
       }
     }
   ]

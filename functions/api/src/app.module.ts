@@ -50,6 +50,9 @@ const synchronize =
         }
 
         if (type === 'postgres') {
+          // 内置 PostgreSQL 是否强制 SSL 由控制台「SSL 配置」开关决定；
+          // 关闭强制时可用非 SSL 连接，故默认不启用，通过 DB_SSL=true 显式打开。
+          const sslEnabled = config.get<string>('DB_SSL', 'false') === 'true'
           // 显式指定泛型并兼用默认值，避免 config.get 推导出联合类型
           return {
             type: 'postgres' as const,
@@ -58,6 +61,7 @@ const synchronize =
             username: config.get<string>('DB_USERNAME') ?? 'postgres',
             password: config.get<string>('DB_PASSWORD') ?? '',
             database: config.get<string>('DB_DATABASE') ?? 'ai_chat',
+            ssl: sslEnabled ? { rejectUnauthorized: false } : false,
             entities: [ApiConfigEntity, Conversation, Message],
             synchronize,
             migrationsRun: !synchronize,
