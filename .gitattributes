@@ -1,0 +1,4 @@
+# CloudBase HTTP 云函数的启动脚本在 Linux 上执行，CRLF 会让平台报「scf_bootstrap 文件不存在」。
+# 只针对需要的文件钉死 LF，不做全局 text=auto，避免顺带改写整个仓库的行尾。
+scf_bootstrap text eol=lf
+*.sh text eol=lf

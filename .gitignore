@@ -12,6 +12,21 @@ dist
 dist-ssr
 *.local
 .env
+.env.local
+.env.*.local
+*.example
+# 运行时数据：SQLite 库文件含明文 API Key 与全部对话记录，禁止入库
+data/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# 构建产物与缓存
+.vite
+coverage
+functions/api/dist
 
 # Editor directories and files
 .vscode/*

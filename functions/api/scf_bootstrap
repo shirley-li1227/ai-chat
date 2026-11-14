@@ -1,0 +1,10 @@
+#!/bin/sh
+# CloudBase HTTP 云函数的启动入口，平台强制约定：
+#   1. 文件必须名为 scf_bootstrap，放在函数代码根目录（这里是 server/）
+#   2. 必须是 LF 换行。带 CRLF 时 Linux 认不出 shebang，控制台会报「scf_bootstrap 文件不存在」
+#   3. 应用必须监听 9000 端口，不能自行改
+export PORT=9000
+
+# 用 exec 让 node 直接接管进程，而不是挂在 sh 下面：
+# SIGTERM 能原样送到 node，NestJS 的 enableShutdownHooks 才有机会执行。
+exec node dist/main

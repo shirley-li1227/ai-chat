@@ -1,0 +1,54 @@
+{
+  "$schema": "https://static.cloudbase.net/cli/cloudbaserc.schema.json",
+  "version": "2.1",
+  "envId": "lucky-lxy-d1g5yv28gd1a13d29",
+  "functionRoot": "./functions",
+  "functions": [
+    {
+      "name": "api",
+      "type": "HTTP",
+      "runtime": "Nodejs20.19",
+      "timeout": 300,
+      "memorySize": 256,
+      "public": true,
+      "installDependency": true,
+      "ignore": [
+        "node_modules",
+        ".git",
+        "src",
+        "data",
+        "test",
+        "dist/tsconfig.*",
+        "tsconfig.json",
+        "tsconfig.build.json",
+        "nest-cli.json",
+        ".env",
+        ".env.local",
+        "*.log"
+      ],
+      "envVariables": {
+        "NODE_ENV": "production",
+        "PORT": "9000",
+        "CORS_ORIGINS": "",
+        "DB_TYPE": "postgres",
+        "DB_SYNCHRONIZE": "true",
+        "DB_HOST": "REPLACE_WITH_TENCENTDB_INTERNAL_HOST",
+        "DB_PORT": "5432",
+        "DB_USERNAME": "REPLACE_WITH_DB_USERNAME",
+        "DB_PASSWORD": "{{env.DB_PASSWORD}}",
+        "DB_DATABASE": "ai_chat",
+        "ENCRYPTION_KEY": "{{env.ENCRYPTION_KEY}}",
+        "AGENT_MAX_TURNS": "6",
+        "THROTTLE_TTL": "60000",
+        "THROTTLE_LIMIT": "10",
+        "FETCH_TIMEOUT_MS": "15000",
+        "FETCH_MAX_BYTES": "1048576",
+        "FETCH_ALLOWED_HOSTS": ""
+      },
+      "vpc": {
+        "vpcId": "vpc-217l0h9i",
+        "subnetId": "subnet-2tyjn5r3"
+      }
+    }
+  ]
+}

@@ -1,18 +1,18 @@
 # AI 聊天助手开发指令
 
 ## 项目概述
-使用 React + TypeScript 开发的 AI 聊天助手，调用智谱 AI API 实现对话功能。
+使用 React + TypeScript 开发的 AI 聊天助手，调用 DeepSeek API 实现对话功能。
 
 ## 开发规范
 - 使用 TypeScript，确保类型安全
 - 使用 Tailwind CSS 编写样式
-- API Key 从环境变量读取，不要硬编码
+- API Key 由用户在页面填写，后端 AES-256-GCM 加密后落库；敏感配置（数据库密码、主密钥）从环境变量注入，不要硬编码
 - 错误要有友好的提示
 
 ## 功能要求
 - 实现流式输出，AI 回答要逐字显示
 - 支持多轮对话，要把历史消息发送给 API
-- 对话历史要保存在 LocalStorage
+- 对话历史持久化到后端数据库（本地开发 SQLite / 生产 Postgres）
 - 支持 Markdown 渲染和代码高亮
 
 ## 注意事项
