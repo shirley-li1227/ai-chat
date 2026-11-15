@@ -37,6 +37,19 @@ export class ConversationsService {
     return this.convRepo.save(conv)
   }
 
+  /**
+   * 确保指定 id 的对话存在：不存在则用该 id 新建。
+   * 用于 sqljs 每实例私有 /tmp、多实例或冷启动导致对话在其它实例缺失时，
+   * 避免 chat 直接抛 NotFoundException（404）。
+   */
+  async ensureExists(id: string): Promise<void> {
+    const conv = await this.convRepo.findOne({ where: { id } })
+    if (!conv) {
+      const created = this.convRepo.create({ id, title: '新对话' })
+      await this.convRepo.save(created)
+    }
+  }
+
   async updateTitle(id: string, title: string): Promise<Conversation> {
     const conv = await this.convRepo.findOne({ where: { id } })
     if (!conv) {

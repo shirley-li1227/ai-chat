@@ -111,6 +111,9 @@ export class ChatService {
       throw new BadRequestException('尚未配置大模型 API，请先在设置中填写接口信息。')
     }
 
+    // 多实例/冷启动下该对话可能不在当前实例的库里，先确保存在，避免下面直接 404
+    await this.conversationsService.ensureExists(conversationId)
+
     // 保存用户消息
     await this.conversationsService.addMessage(conversationId, 'user', content)
 

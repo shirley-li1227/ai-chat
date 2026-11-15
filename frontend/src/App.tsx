@@ -65,6 +65,18 @@ function App() {
     loadMessages()
   }, [activeConversationId])
 
+  // 离开页面 / 组件卸载时主动断开在途的 SSE 流：
+  // 浏览器虽会在整页卸载时自动断连，但 CloudBase 网关对 SSE 的 close 透传不保证实时，
+  // 主动 abort 可及时停掉后端对上游大模型的请求，避免继续消耗额度、落库半截回答。
+  useEffect(() => {
+    const onLeave = () => abortRef.current?.abort()
+    window.addEventListener('pagehide', onLeave)
+    return () => {
+      window.removeEventListener('pagehide', onLeave)
+      abortRef.current?.abort()
+    }
+  }, [])
+
   const activeConversation = conversations.find(
     (conversation) => conversation.id === activeConversationId,
   )
