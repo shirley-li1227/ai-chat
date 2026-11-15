@@ -26,6 +26,9 @@ const synchronize =
     ThrottlerModule.forRootAsync({
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
+        // 本地开发放行：计数只在进程内存里，对 Serverless 本就不生效；
+        // 开发时 StrictMode 每个请求双发，10 次/分钟会挡住流式收尾后的重载，误报「请求失败」
+        skipIf: () => !isProduction,
         throttlers: [
           {
             ttl: Number(config.get('THROTTLE_TTL', 60000)),

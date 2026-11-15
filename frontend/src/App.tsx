@@ -15,6 +15,8 @@ import {
 } from './client'
 import type { ConfigResponse } from './client'
 
+const BACKEND_DOWN = '无法连接到后端服务，请确认已启动 npm run dev:api'
+
 function App() {
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [activeConversationId, setActiveConversationId] = useState<string>('')
@@ -25,6 +27,21 @@ function App() {
   const [configModalOpen, setConfigModalOpen] = useState(false)
   const abortRef = useRef<AbortController | null>(null)
 
+  /** 拉会话列表，没有就建一个；返回当前应使用的会话。 */
+  const loadConversations = useCallback(async (): Promise<Conversation> => {
+    const list = await fetchConversations()
+    if (list.length > 0) {
+      setConversations(list)
+      setActiveConversationId(list[0].id)
+      return list[0]
+    }
+
+    const conv = await createConversation()
+    setConversations([conv])
+    setActiveConversationId(conv.id)
+    return conv
+  }, [])
+
   // Load config and conversations on mount
   useEffect(() => {
     const init = async () => {
@@ -32,23 +49,14 @@ function App() {
         const cfg = await fetchConfig()
         setConfigStatus(cfg)
         setHasConfig(cfg !== null)
-
-        const list = await fetchConversations()
-        if (list.length > 0) {
-          setConversations(list)
-          setActiveConversationId(list[0].id)
-        } else {
-          const conv = await createConversation()
-          setConversations([conv])
-          setActiveConversationId(conv.id)
-        }
+        await loadConversations()
       } catch {
         // Backend not available yet
-        setErrorMessage('无法连接到后端服务，请确认已启动 npm run start:dev')
+        setErrorMessage(BACKEND_DOWN)
       }
     }
     init()
-  }, [])
+  }, [loadConversations])
 
   // Load messages when switching conversation
   useEffect(() => {
@@ -85,7 +93,11 @@ function App() {
   const hasEmptyConversation = conversations.some((conversation) => conversation.messages.length === 0)
 
   const handleSend = async (content: string) => {
-    if (!activeConversation) {
+    // 首屏加载撞上后端重启时会话列表会停在空态，这里补拉一次而不是无声失败
+    const target =
+      activeConversation ?? (await loadConversations().catch(() => null))
+    if (!target) {
+      setErrorMessage(BACKEND_DOWN)
       return
     }
 
@@ -113,7 +125,7 @@ function App() {
 
     setConversations((prev) =>
       prev.map((conversation) => {
-        if (conversation.id !== activeConversation.id) {
+        if (conversation.id !== target.id) {
           return conversation
         }
         const nextMessages = [...conversation.messages, userMessage, assistantMessage]
@@ -137,12 +149,12 @@ function App() {
 
     try {
       await streamChat(
-        activeConversation.id,
+        target.id,
         content,
         (chunk) => {
           setConversations((prev) =>
             prev.map((conversation) => {
-              if (conversation.id !== activeConversation.id) {
+              if (conversation.id !== target.id) {
                 return conversation
               }
               return {
@@ -174,7 +186,7 @@ function App() {
 
           setConversations((prev) =>
             prev.map((conversation) => {
-              if (conversation.id !== activeConversation.id) {
+              if (conversation.id !== target.id) {
                 return conversation
               }
               return {
@@ -195,10 +207,10 @@ function App() {
         controller.signal,
       )
       // 流结束后从 DB 重载，确保 steps 轨迹与持久化结果一致
-      const refreshed = await fetchConversation(activeConversation.id)
+      const refreshed = await fetchConversation(target.id)
       setConversations((prev) =>
         prev.map((conversation) =>
-          conversation.id === activeConversation.id ? refreshed : conversation,
+          conversation.id === target.id ? refreshed : conversation,
         ),
       )
     } catch (error) {
@@ -209,7 +221,7 @@ function App() {
         setErrorMessage(`请求失败：${msg}`)
         setConversations((prev) =>
           prev.map((conversation) => {
-            if (conversation.id !== activeConversation.id) {
+            if (conversation.id !== target.id) {
               return conversation
             }
             return {

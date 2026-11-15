@@ -123,7 +123,7 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 |--------|------|------|
 | GET | `/api/health` | `{ status, database: up/down, encryption: enabled/disabled, promptVersion }` |
 
-全局：所有接口受 `ThrottlerGuard` 按 IP 限流（`THROTTLE_TTL` / `THROTTLE_LIMIT`）。
+全局：所有接口受 `ThrottlerGuard` 按 IP 限流（`THROTTLE_TTL` / `THROTTLE_LIMIT`），仅 `NODE_ENV=production` 生效——本地开发 StrictMode 双发请求会很快撞上限流。
 
 ### 配置管理
 
