@@ -7,6 +7,24 @@ import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import type { Conversation, Message, ToolStep } from '../types'
 import type { ConfigResponse } from '../client'
 
+/** 等待首个 token 时的占位：空气泡只有内边距，看不出正在生成 */
+function GeneratingIndicator() {
+  return (
+    <span className="inline-flex items-center gap-2 text-slate-400">
+      <svg
+        viewBox="0 0 24 24"
+        className="h-4 w-4 animate-spin"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2.5"
+      >
+        <path d="M12 3a9 9 0 1 0 9 9" strokeLinecap="round" />
+      </svg>
+      <span>正在思考…</span>
+    </span>
+  )
+}
+
 /** Agent 工具轨迹展示面板 */
 function ToolStepsPanel({ steps }: { steps: ToolStep[] }) {
   const [expanded, setExpanded] = useState(true)
@@ -401,6 +419,8 @@ export default function ChatInterface({
 
             {messages.map((message) => {
               const isUser = message.role === 'user'
+              const isGenerating =
+                isSending && !isUser && message.timestamp === lastAssistantTimestamp
               return (
                 <div key={message.timestamp} className={`flex w-full ${isUser ? 'justify-end' : 'justify-start'}`}>
                   {/* min-w-0 解除 flex 子项 min-width:auto 的下限，避免宽表格顶破 82% 宽度上限 */}
@@ -416,6 +436,9 @@ export default function ChatInterface({
                       <div className="break-words [&_a]:text-blue-600 [&_ol]:list-decimal [&_ol]:pl-6 [&_ul]:list-disc [&_ul]:pl-6">
                         {!isUser && message.steps?.length ? (
                           <ToolStepsPanel steps={message.steps} />
+                        ) : null}
+                        {isGenerating && !message.content && !message.steps?.length ? (
+                          <GeneratingIndicator />
                         ) : null}
                         <ReactMarkdown
                           remarkPlugins={[remarkGfm]}
