@@ -1,9 +1,17 @@
-import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, UpdateDateColumn } from 'typeorm'
+import { Entity, Index, PrimaryGeneratedColumn, Column, CreateDateColumn, UpdateDateColumn } from 'typeorm'
 
 @Entity('api_config')
 export class ApiConfigEntity {
   @PrimaryGeneratedColumn('uuid')
   id: string
+
+  /**
+   * 配置归属的用户。鉴权上线前这张表是单租户的，历史行为 NULL，
+   * 由第一个注册账号认领（见 ConfigService.claimUnowned）。
+   */
+  @Index()
+  @Column({ type: 'varchar', length: 36, nullable: true })
+  userId: string | null
 
   @Column({ default: 'deepseek' })
   provider: string

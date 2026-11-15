@@ -1,10 +1,18 @@
-import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, UpdateDateColumn, OneToMany } from 'typeorm'
+import { Entity, Index, PrimaryGeneratedColumn, Column, CreateDateColumn, UpdateDateColumn, OneToMany } from 'typeorm'
 import { Message } from './message.entity'
 
 @Entity('conversations')
 export class Conversation {
   @PrimaryGeneratedColumn('uuid')
   id: string
+
+  /**
+   * 会话归属用户。鉴权上线前的历史会话为 NULL，由第一个注册账号认领
+   * （见 ConversationsService.claimUnowned），否则本地已有记录会在登录后消失。
+   */
+  @Index()
+  @Column({ type: 'varchar', length: 36, nullable: true })
+  userId: string | null
 
   @Column({ default: '新对话' })
   title: string

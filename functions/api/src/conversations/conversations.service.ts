@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException } from '@nestjs/common'
 import { InjectRepository } from '@nestjs/typeorm'
-import { MoreThanOrEqual, Repository } from 'typeorm'
+import { IsNull, MoreThanOrEqual, Repository } from 'typeorm'
 import { Conversation } from './conversation.entity'
 import { Message } from './message.entity'
 
@@ -20,27 +20,22 @@ export class ConversationsService {
     private readonly msgRepo: Repository<Message>,
   ) {}
 
-  async findAll(): Promise<Conversation[]> {
+  async findAll(userId: string): Promise<Conversation[]> {
     return this.convRepo.find({
+      where: { userId },
       order: { createdAt: 'DESC' },
       relations: { messages: false },
     })
   }
 
-  async findOne(id: string): Promise<Conversation> {
-    const conv = await this.convRepo.findOne({
-      where: { id },
-      relations: { messages: true },
-    })
-    if (!conv) {
-      throw new NotFoundException('对话不存在')
-    }
+  async findOne(userId: string, id: string): Promise<Conversation> {
+    const conv = await this.owned(userId, id, { messages: true })
     conv.messages.sort((a, b) => a.timestamp - b.timestamp)
     return conv
   }
 
-  async create(): Promise<Conversation> {
-    const conv = this.convRepo.create({ title: '新对话' })
+  async create(userId: string): Promise<Conversation> {
+    const conv = this.convRepo.create({ title: '新对话', userId })
     return this.convRepo.save(conv)
   }
 
@@ -48,43 +43,46 @@ export class ConversationsService {
    * 确保指定 id 的对话存在：不存在则用该 id 新建。
    * 用于 sqljs 每实例私有 /tmp、多实例或冷启动导致对话在其它实例缺失时，
    * 避免 chat 直接抛 NotFoundException（404）。
+   *
+   * id 已存在但属于别人时一律按“不存在”处理：既不能读写他人会话，
+   * 也不能拿同一个 id 去撞主键。
    */
-  async ensureExists(id: string): Promise<void> {
-    const conv = await this.convRepo.findOne({ where: { id } })
-    if (!conv) {
-      const created = this.convRepo.create({ id, title: '新对话' })
-      await this.convRepo.save(created)
+  async ensureExists(userId: string, id: string): Promise<void> {
+    const existing = await this.convRepo.findOne({ where: { id } })
+    if (existing) {
+      if (existing.userId !== userId) {
+        throw new NotFoundException('对话不存在')
+      }
+      return
     }
+
+    const created = this.convRepo.create({ id, title: '新对话', userId })
+    await this.convRepo.save(created)
   }
 
-  async updateTitle(id: string, title: string): Promise<Conversation> {
-    const conv = await this.convRepo.findOne({ where: { id } })
-    if (!conv) {
-      throw new NotFoundException('对话不存在')
-    }
+  async updateTitle(
+    userId: string,
+    id: string,
+    title: string,
+  ): Promise<Conversation> {
+    const conv = await this.owned(userId, id)
     conv.title = title
     return this.convRepo.save(conv)
   }
 
-  async remove(id: string): Promise<void> {
-    const conv = await this.convRepo.findOne({ where: { id } })
-    if (!conv) {
-      throw new NotFoundException('对话不存在')
-    }
+  async remove(userId: string, id: string): Promise<void> {
+    const conv = await this.owned(userId, id)
     await this.convRepo.remove(conv)
   }
 
   /**
    * 一次性取回裁剪上下文所需的全部信息，避免 ChatService 为了算窗口再跑一次查询。
    */
-  async loadContext(id: string): Promise<ConversationContext> {
-    const conv = await this.convRepo.findOne({
-      where: { id },
-      relations: { messages: true },
-    })
-    if (!conv) {
-      throw new NotFoundException('对话不存在')
-    }
+  async loadContext(
+    userId: string,
+    id: string,
+  ): Promise<ConversationContext> {
+    const conv = await this.owned(userId, id, { messages: true })
     const messages = [...conv.messages].sort((a, b) => a.timestamp - b.timestamp)
     return {
       messages,
@@ -98,11 +96,12 @@ export class ConversationsService {
    * 前端会话列表排序会因此跳动。
    */
   async saveContext(
+    userId: string,
     id: string,
     summary: string,
     summaryUntil: number,
   ): Promise<void> {
-    const conv = await this.convRepo.findOne({ where: { id } })
+    const conv = await this.convRepo.findOne({ where: { id, userId } })
     if (!conv) {
       return
     }
@@ -125,13 +124,11 @@ export class ConversationsService {
    * 摘要里就会残留根本不存在的对话，必须一并作废重新开始。
    */
   async truncateFrom(
+    userId: string,
     id: string,
     fromTimestamp: number,
   ): Promise<{ removed: number; summaryReset: boolean }> {
-    const conv = await this.convRepo.findOne({ where: { id } })
-    if (!conv) {
-      throw new NotFoundException('对话不存在')
-    }
+    const conv = await this.owned(userId, id)
 
     const doomed = await this.msgRepo.find({
       where: {
@@ -155,15 +152,13 @@ export class ConversationsService {
   }
 
   async addMessage(
+    userId: string,
     conversationId: string,
     role: 'user' | 'assistant',
     content: string,
     steps?: Array<{ id: string; name: string; arguments: string; result: string; ok: boolean }>,
   ): Promise<Message> {
-    const conv = await this.convRepo.findOne({ where: { id: conversationId } })
-    if (!conv) {
-      throw new NotFoundException('对话不存在')
-    }
+    const conv = await this.owned(userId, conversationId)
     const msg = this.msgRepo.create({
       role,
       content,
@@ -184,5 +179,26 @@ export class ConversationsService {
     }
 
     return saved
+  }
+
+  /** 把鉴权上线前的无主会话归给指定用户 */
+  async claimUnowned(userId: string): Promise<void> {
+    await this.convRepo.update({ userId: IsNull() }, { userId })
+  }
+
+  /**
+   * 归属校验的唯一入口：id 查得到但 userId 不匹配时，一律按 404 处理，
+   * 不区分“不存在”和“不是你的”，免得接口变成会话 id 探测工具。
+   */
+  private async owned(
+    userId: string,
+    id: string,
+    relations?: { messages: boolean },
+  ): Promise<Conversation> {
+    const conv = await this.convRepo.findOne({ where: { id, userId }, relations })
+    if (!conv) {
+      throw new NotFoundException('对话不存在')
+    }
+    return conv
   }
 }

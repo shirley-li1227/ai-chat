@@ -3,6 +3,7 @@ import { InjectDataSource } from '@nestjs/typeorm'
 import { DataSource } from 'typeorm'
 import { SecretCipher } from '../security/secret-cipher'
 import { PROMPT_VERSION } from '../chat/prompt'
+import { Public } from '../auth/auth.decorators'
 
 @Controller('api/health')
 export class HealthController {
@@ -15,6 +16,7 @@ export class HealthController {
    * 供容器 HEALTHCHECK 与负载均衡探活。
    * 数据库不可用时返回 503，使编排层能识别为不健康并重启/摘流。
    */
+  @Public()
   @Get()
   async check() {
     try {

@@ -1,34 +1,42 @@
 import { Controller, Get, Post, Patch, Delete, Body, Param } from '@nestjs/common'
 import { ConversationsService } from './conversations.service'
 import { TruncateConversationDto } from './truncate-conversation.dto'
+import { CurrentUser } from '../auth/auth.decorators'
+import type { AuthUser } from '../auth/auth.decorators'
 
 @Controller('api/conversations')
 export class ConversationsController {
-  constructor(private readonly service: ConversationsService) {}
+  constructor(
+    private readonly service: ConversationsService,
+  ) {}
 
   @Get()
-  findAll() {
-    return this.service.findAll()
+  findAll(@CurrentUser() user: AuthUser) {
+    return this.service.findAll(user.id)
   }
 
   @Post()
-  create() {
-    return this.service.create()
+  create(@CurrentUser() user: AuthUser) {
+    return this.service.create(user.id)
   }
 
   @Get(':id')
-  findOne(@Param('id') id: string) {
-    return this.service.findOne(id)
+  findOne(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.service.findOne(user.id, id)
   }
 
   @Patch(':id')
-  updateTitle(@Param('id') id: string, @Body() body: { title: string }) {
-    return this.service.updateTitle(id, body.title)
+  updateTitle(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body() body: { title: string },
+  ) {
+    return this.service.updateTitle(user.id, id, body.title)
   }
 
   @Delete(':id')
-  remove(@Param('id') id: string) {
-    return this.service.remove(id)
+  remove(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.service.remove(user.id, id)
   }
 
   /**
@@ -37,9 +45,10 @@ export class ConversationsController {
    */
   @Post(':id/truncate')
   truncate(
+    @CurrentUser() user: AuthUser,
     @Param('id') id: string,
     @Body() body: TruncateConversationDto,
   ) {
-    return this.service.truncateFrom(id, body.fromTimestamp)
+    return this.service.truncateFrom(user.id, id, body.fromTimestamp)
   }
 }

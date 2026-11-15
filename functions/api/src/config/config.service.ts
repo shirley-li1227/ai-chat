@@ -5,7 +5,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common'
 import { InjectRepository } from '@nestjs/typeorm'
-import { Repository } from 'typeorm'
+import { Repository, IsNull } from 'typeorm'
 import { ApiConfigEntity } from './api-config.entity'
 import { SecretCipher } from '../security/secret-cipher'
 
@@ -35,8 +35,8 @@ export class ConfigService {
   }
 
   /** 返回解密后的配置，供 ChatService 直接调用上游使用 */
-  async get(): Promise<PlainApiConfig | null> {
-    const entity = await this.latest()
+  async get(userId: string): Promise<PlainApiConfig | null> {
+    const entity = await this.latest(userId)
     if (!entity) {
       return null
     }
@@ -52,7 +52,7 @@ export class ConfigService {
     // 主密钥缺失时只读不改，不把明文再写一遍，也不阻断已有会话。
     if (!this.cipher.isEncrypted(entity.apiKey)) {
       if (this.cipher.enabled) {
-        await this.save(plainConfig)
+        await this.save(userId, plainConfig)
         this.logger.warn('检测到明文历史配置，已自动加密回写')
       } else {
         this.logger.warn('检测到明文历史配置，但主密钥不可用，本次不迁移')
@@ -75,11 +75,12 @@ export class ConfigService {
   }
 
   /**
-   * 取最近一条配置。单行表用 findOne 必须带 where，
-   * 这里改用 find + take:1 避开该限制。
+   * 取该用户最近一条配置。用 find + take:1 而不是 findOne，
+   * 后者在本项目里必须带 where 且不支持只按 order 取单条。
    */
-  private async latest(): Promise<ApiConfigEntity | null> {
+  private async latest(userId: string): Promise<ApiConfigEntity | null> {
     const items = await this.repo.find({
+      where: { userId },
       order: { updatedAt: 'DESC' },
       take: 1,
     })
@@ -87,7 +88,7 @@ export class ConfigService {
   }
 
   /** 落库前加密；主密钥不可用则直接拒绝，任何情况下都不会写入明文 */
-  async save(data: PlainApiConfig): Promise<ApiConfigEntity> {
+  async save(userId: string, data: PlainApiConfig): Promise<ApiConfigEntity> {
     if (!this.cipher.enabled) {
       throw new BadRequestException(
         `${this.cipher.disableReason}，为防止 API Key 明文落库已拒绝保存。` +
@@ -102,16 +103,21 @@ export class ConfigService {
       baseUrl: data.baseUrl,
       model: data.model,
     }
-    const existing = await this.latest()
+    const existing = await this.latest(userId)
     if (existing) {
       Object.assign(existing, payload)
       return this.repo.save(existing)
     }
-    const entity = this.repo.create(payload)
+    const entity = this.repo.create({ ...payload, userId })
     return this.repo.save(entity)
   }
 
-  async clear(): Promise<void> {
-    await this.repo.clear()
+  async clear(userId: string): Promise<void> {
+    await this.repo.delete({ userId })
+  }
+
+  /** 把鉴权上线前的无主配置归给指定用户 */
+  async claimUnowned(userId: string): Promise<void> {
+    await this.repo.update({ userId: IsNull() }, { userId })
   }
 }

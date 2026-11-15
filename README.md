@@ -7,6 +7,7 @@
 - 流式输出：AI 回答逐字显示（SSE）
 - 多轮对话：自动携带历史消息上下文，可按 token 预算滑窗裁剪
 - 多会话管理：创建、切换、删除对话
+- 多用户账号：注册/登录后才进入聊天界面，API Key 与对话记录按账号隔离
 - 多轮管理：最后一轮可「重新生成」，历史提问可「编辑重发」（回退到该条再重来）
 - Markdown 渲染：支持 GFM 表格、任务列表、代码高亮
 - API 配置弹窗：运行时填写大模型 API Key，无需重启
@@ -50,12 +51,15 @@ npm run dev
 
 ### 首次配置
 
-1. 页面会提示"未配置 API"，点击右上角徽章或"立即配置"按钮
-2. 在弹窗中填入 DeepSeek API Key（从 https://platform.deepseek.com 获取）
-3. 点击"保存并应用"，Key 经 AES-256-GCM 加密后写入后端数据库
-4. 即可开始对话
+1. 打开页面先进入登录页，切到「注册」标签建一个账号（注册成功即自动登录）
+2. 登录账号没有保存过 API Key 时，会自动弹出「大模型 API 设置」
+3. 填入 DeepSeek API Key（从 https://platform.deepseek.com 获取），模型名与 Base URL 用默认值即可
+4. 点击"保存并应用"，Key 经 AES-256-GCM 加密后写入后端数据库，并归属当前账号
+5. 即可开始对话；下次登录同一账号会直接带出已保存的 Key，无需重新填写
 
 > 主密钥 `ENCRYPTION_KEY`（64 位十六进制）缺失或格式非法时，保存会返回明确错误——为避免明文落库，后端不会降级成明文存储。
+
+> 引入登录之前生成的对话与大模型配置没有归属，第一个注册的账号会自动认领它们，之后各账号互相看不到。
 
 ## 项目结构
 
@@ -125,11 +129,15 @@ DeepSeek API
 CloudBase HTTP 网关 ── 路径透传 /api/*；安全域名注入 CORS 并直接应答 OPTIONS 预检
   ▼
 HTTP 云函数 api（scf_bootstrap → NestJS :9000）
+  ├─ /api/auth/* (register|login 免登录) → scrypt 校验 → 建会话；其余接口一律带 Authorization: Bearer
   ├─ /api/config | /api/conversations | /api/health  → TypeORM
   └─ /api/chat (SSE) → 存 user message → 按 token 预算裁剪历史（旧轮次进摘要）
                        → 注入 system prompt → fetch DeepSeek（stream + tools，最多 MAX_TURNS 轮）
                        → 透传 content / tool 事件 → 存 assistant message
 ```
+
+> 前端与云函数不同源，业务请求都带 `Authorization` 头，触发 CORS 预检：静态托管的跨域规则必须放行该请求头，
+> 否则登录成功后所有业务接口仍会在浏览器侧被拦下。
 
 一次对话的事件顺序：`tool(calling)`×N → `tool(done)`×N（同一轮多个工具**并发执行**，calling 先全部发出，done 按 `tool_calls` 原顺序回填）→ `content` 逐字 → `notice?`（截断提示）或 `error` → `data: [DONE]`。
 

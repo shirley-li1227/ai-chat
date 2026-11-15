@@ -10,6 +10,10 @@ import { ConfigModule as AppConfigModule } from './config/config.module'
 import { ConversationsModule } from './conversations/conversations.module'
 import { ChatModule } from './chat/chat.module'
 import { HealthModule } from './health/health.module'
+import { AuthModule } from './auth/auth.module'
+import { AuthGuard } from './auth/auth.guard'
+import { User } from './auth/user.entity'
+import { Session } from './auth/session.entity'
 
 const isProduction = process.env.NODE_ENV === 'production'
 const synchronize =
@@ -65,7 +69,7 @@ const synchronize =
             password: config.get<string>('DB_PASSWORD') ?? '',
             database: config.get<string>('DB_DATABASE') ?? 'ai_chat',
             ssl: sslEnabled ? { rejectUnauthorized: false } : false,
-            entities: [ApiConfigEntity, Conversation, Message],
+            entities: [ApiConfigEntity, Conversation, Message, User, Session],
             synchronize,
             migrationsRun: !synchronize,
           }
@@ -75,7 +79,7 @@ const synchronize =
           type: 'sqljs' as const,
           location: config.get<string>('DB_LOCATION') ?? 'data/app.db',
           autoSave: true,
-          entities: [ApiConfigEntity, Conversation, Message],
+          entities: [ApiConfigEntity, Conversation, Message, User, Session],
           synchronize,
         }
       },
@@ -85,7 +89,13 @@ const synchronize =
     ConversationsModule,
     ChatModule,
     HealthModule,
+    AuthModule,
   ],
-  providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
+  // 顺序即执行顺序：先按 IP 限流，再校验登录态。
+  // AuthGuard 挂在 globally 而不是逐个控制器加，新接口默认就是需要登录的。
+  providers: [
+    { provide: APP_GUARD, useClass: ThrottlerGuard },
+    { provide: APP_GUARD, useClass: AuthGuard },
+  ],
 })
 export class AppModule {}

@@ -1,14 +1,16 @@
 import { Controller, Get, Post, Delete, Body } from '@nestjs/common'
 import { ConfigService } from './config.service'
 import { SaveApiConfigDto } from './save-api-config.dto'
+import { CurrentUser } from '../auth/auth.decorators'
+import type { AuthUser } from '../auth/auth.decorators'
 
 @Controller('api/config')
 export class ConfigController {
   constructor(private readonly configService: ConfigService) {}
 
   @Get()
-  async get() {
-    const config = await this.configService.get()
+  async get(@CurrentUser() user: AuthUser) {
+    const config = await this.configService.get(user.id)
     if (!config) {
       return { configured: false }
     }
@@ -22,8 +24,8 @@ export class ConfigController {
   }
 
   @Post()
-  async save(@Body() body: SaveApiConfigDto) {
-    return this.configService.save({
+  save(@CurrentUser() user: AuthUser, @Body() body: SaveApiConfigDto) {
+    return this.configService.save(user.id, {
       provider: body.provider,
       apiKey: body.apiKey,
       baseUrl: body.baseUrl,
@@ -32,8 +34,8 @@ export class ConfigController {
   }
 
   @Delete()
-  async clear() {
-    await this.configService.clear()
+  async clear(@CurrentUser() user: AuthUser) {
+    await this.configService.clear(user.id)
     return { success: true }
   }
 }

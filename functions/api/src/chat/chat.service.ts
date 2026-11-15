@@ -116,11 +116,15 @@ export class ChatService {
    * 也不会既出现在摘要里又原文重发。
    */
   private async buildContext(
+    userId: string,
     config: PlainApiConfig,
     conversationId: string,
     signal?: AbortSignal,
   ): Promise<{ historyMessages: OutboundMessage[]; summary: string | null }> {
-    const ctx = await this.conversationsService.loadContext(conversationId)
+    const ctx = await this.conversationsService.loadContext(
+      userId,
+      conversationId,
+    )
     const messages = ctx.messages
       .filter((m) => m.role === 'user' || m.role === 'assistant')
       .map((m) => ({
@@ -161,30 +165,42 @@ export class ChatService {
       signal,
     )
     const boundary = dropped[dropped.length - 1].timestamp
-    await this.conversationsService.saveContext(conversationId, nextSummary, boundary)
+    await this.conversationsService.saveContext(
+      userId,
+      conversationId,
+      nextSummary,
+      boundary,
+    )
 
     return { historyMessages: expand(kept), summary: nextSummary }
   }
 
   async streamChat(
+    userId: string,
     conversationId: string,
     content: string,
     res: Response,
     signal?: AbortSignal,
   ): Promise<void> {
-    const config = await this.configService.get()
+    const config = await this.configService.get(userId)
     if (!config) {
       throw new BadRequestException('尚未配置大模型 API，请先在设置中填写接口信息。')
     }
 
     // 多实例/冷启动下该对话可能不在当前实例的库里，先确保存在，避免下面直接 404
-    await this.conversationsService.ensureExists(conversationId)
+    await this.conversationsService.ensureExists(userId, conversationId)
 
     // 保存用户消息
-    await this.conversationsService.addMessage(conversationId, 'user', content)
+    await this.conversationsService.addMessage(
+      userId,
+      conversationId,
+      'user',
+      content,
+    )
 
     // 读取会话上下文：最近若干轮发原文，更早的内容走滚动摘要
     const { historyMessages, summary } = await this.buildContext(
+      userId,
       config,
       conversationId,
       signal,
@@ -353,6 +369,7 @@ export class ChatService {
 
       if (finalContent) {
         await this.conversationsService.addMessage(
+          userId,
           conversationId,
           'assistant',
           finalContent,
@@ -367,7 +384,7 @@ export class ChatService {
         // 用户中断：保留已生成的部分回答及工具轨迹
         if (finalContent) {
           await this.conversationsService
-            .addMessage(conversationId, 'assistant', finalContent, steps)
+            .addMessage(userId, conversationId, 'assistant', finalContent, steps)
             .catch(() => undefined)
         }
         res.end()

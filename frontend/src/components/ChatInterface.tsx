@@ -5,7 +5,7 @@ import remarkGfm from 'remark-gfm'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import type { Conversation, Message, ToolStep } from '../types'
-import type { ConfigResponse } from '../client'
+import type { ConfigResponse, AuthUser } from '../client'
 
 /** 等待首个 token 时的占位：空气泡只有内边距，看不出正在生成 */
 function GeneratingIndicator() {
@@ -92,6 +92,7 @@ function ToolStepsPanel({ steps }: { steps: ToolStep[] }) {
 }
 
 interface ChatInterfaceProps {
+  user: AuthUser
   conversations: Conversation[]
   activeConversationId: string
   hasEmptyConversation: boolean
@@ -110,6 +111,7 @@ interface ChatInterfaceProps {
   onNewChat: () => void
   onSelectConversation: (conversationId: string) => void
   onDeleteConversation: (conversationId: string) => void
+  onLogout: () => void
 }
 
 function formatTime(timestamp: number): string {
@@ -121,6 +123,7 @@ function formatTime(timestamp: number): string {
 }
 
 export default function ChatInterface({
+  user,
   conversations,
   activeConversationId,
   hasEmptyConversation,
@@ -137,6 +140,7 @@ export default function ChatInterface({
   onNewChat,
   onSelectConversation,
   onDeleteConversation,
+  onLogout,
 }: ChatInterfaceProps) {
   const [input, setInput] = useState('')
   const [copiedTimestamp, setCopiedTimestamp] = useState<number | null>(null)
@@ -360,6 +364,7 @@ export default function ChatInterface({
         <section className="flex min-w-0 flex-1 flex-col bg-slate-50/50">
           <header className="flex items-center justify-between gap-3 border-b border-slate-200/70 bg-white/70 px-5 py-4 text-sm font-medium text-slate-700 backdrop-blur-sm">
             <span className="rounded-full bg-emerald-100 px-3 py-1 text-emerald-700">AI 聊天助手</span>
+            <div className="flex items-center gap-2">
             <button
               type="button"
               onClick={onOpenConfig}
@@ -380,6 +385,28 @@ export default function ChatInterface({
                 <path d="M19.4 15a1.7 1.7 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.82-.33 1.7 1.7 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1-1.51 1.7 1.7 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .33-1.82 1.7 1.7 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.51-1 1.7 1.7 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.82.33H9a1.7 1.7 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.51 1.7 1.7 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.33 1.82V9a1.7 1.7 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1z" />
               </svg>
             </button>
+
+            <span
+              className="hidden items-center gap-1.5 rounded-full bg-slate-100/90 px-3 py-1.5 text-xs font-medium text-slate-600 sm:inline-flex"
+              title={`当前账号：${user.username}`}
+            >
+              <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
+                <circle cx="12" cy="8" r="4" />
+                <path d="M4 20a8 8 0 0 1 16 0" />
+              </svg>
+              {user.username}
+            </span>
+
+            <button
+              type="button"
+              onClick={onLogout}
+              disabled={isSending}
+              className="rounded-full border border-slate-200 bg-white/80 px-3 py-1.5 text-xs text-slate-500 shadow-sm transition hover:border-red-200 hover:bg-red-50/60 hover:text-red-600 disabled:cursor-not-allowed disabled:opacity-60"
+              title={isSending ? '生成中无法退出，请先停止回答' : '退出当前账号'}
+            >
+              退出登录
+            </button>
+            </div>
           </header>
 
           {errorMessage ? (

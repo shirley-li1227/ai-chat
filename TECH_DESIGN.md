@@ -79,11 +79,12 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 
 ## 数据模型
 
-### ApiConfig（单行表）
+### ApiConfig（按账号一行）
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | id | uuid PK | 自动 |
+| userId | varchar(36), nullable | 归属账号。鉴权上线前的旧行是 NULL，由第一个注册账号认领；同账号取 `updatedAt` 最近的一条 |
 | provider | varchar | 供应商标识（'deepseek'） |
 | apiKey | varchar(512) | AES-256-GCM 密文，格式 `gcm1:<iv-hex>:<tag-hex>:<cipher-b64>`；主密钥缺失时拒绝保存，不退化成明文 |
 | baseUrl | varchar | API 基地址 |
@@ -91,11 +92,35 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 | createdAt | datetime | 创建时间 |
 | updatedAt | datetime | 最后更新时间 |
 
+### User
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | uuid PK | 自动 |
+| username | varchar(32), unique index | 统一小写存储，注册/登录前先 `trim().toLowerCase()`，避免大小写变体各占一个账号 |
+| passwordHash | varchar(256) | `scrypt$N$r$p$salt$hash`，参数随散列一起存，日后调参不影响老口令校验 |
+| createdAt / updatedAt | datetime | 自动 |
+
+口令用 Node 内置 `crypto.scrypt` 加盐散列（N=16384、r=8、p=1、16 字节随机盐、32 字节输出，约 16MB 内存，落在 Node 默认 maxmem 内）。校验前对输入做 NFKC 归一，避免同形字符导致“看着一样却登不进去”。
+
+### Session
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | uuid PK | 自动 |
+| token | varchar(64), unique index | `randomBytes(32).toString('hex')`，前端存 localStorage 并以 `Authorization: Bearer` 发送 |
+| userId | varchar(36), index | 所属账号。用 varchar 而不是 uuid FK，兼容 sqljs 与 PostgreSQL 两边建表 |
+| expiresAt | datetime | 固定 30 天，不做滑动续期：续期要写库，等于每次请求都碰一次会话表 |
+| createdAt | datetime | 自动 |
+
+过期会话在 `resolve()` 命中时顺手删除，不额外跑定时任务。
+
 ### Conversation
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | id | uuid PK | 自动 |
+| userId | varchar(36), nullable | 归属账号；所有读写都先过 `owned(userId, id)`，越权访问统一按 404 处理 |
 | title | varchar | 对话标题（自动取首条用户消息前 24 字） |
 | contextSummary | text, nullable | 滑出上下文窗口的旧轮次归并成的**滚动摘要**；存库里而不是每轮重算，否则对话越长压缩成本反超节省量 |
 | summaryUntil | bigint, nullable | 摘要已覆盖到的消息时间戳（含）。时间戳 ≤ 该值的消息视为“已在摘要里”，避免同一段对话既在摘要里又原文重发 |
@@ -116,6 +141,21 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 | conversation | FK → Conversation | 所属对话（CASCADE 删除） |
 
 ## API 接口设计
+
+### 认证
+
+| Method | Path | 请求体 | 响应 |
+|--------|------|--------|------|
+| POST | `/api/auth/register` | `{ username, password }` | `{ token, user: { id, username } }`，注册成功即登录 |
+| POST | `/api/auth/login` | `{ username, password }` | 同上；用户名或密码错误统一返回 401「用户名或密码不正确」 |
+| POST | `/api/auth/logout` | — | `{ success: true }`，删除当前 token 对应的会话 |
+| GET | `/api/auth/me` | — | `{ id, username }`；无 token 时 401 |
+
+`register` / `login` / `health` 用 `@Public()` 放行，其余接口由全局 `AuthGuard` 解析 `Authorization: Bearer <token>`，
+把用户挂到 `request.user` 供控制器 `@CurrentUser()` 取用；token 缺失返回 401「请先登录」，
+不存在或已过期返回 401「登录已过期，请重新登录」。
+
+守卫顺序：`ThrottlerGuard` → `AuthGuard`（先限流再查库，避免撞限流的请求白跑一次会话查询）。
 
 ### 健康检查
 
@@ -220,6 +260,9 @@ SYSTEM_PROMPT / SUMMARY_PROMPT 从 service 里抽到 `chat/prompt.ts`，并导�
 ### 安全设计
 
 - API Key 经 AES-256-GCM 加密后落库，主密钥 `ENCRYPTION_KEY` 从环境变量注入；`GET /api/config` 只返回 `apiKeyMasked`
+- 口令用 `crypto.scrypt` 加盐散列存储，明文不落库、不写日志；登录接口无论用户是否存在都执行一次 scrypt（不存在时比对固定 `DUMMY_HASH`），避免用响应耗时枚举用户名
+- 业务接口全部要求 Bearer token；所有会话读写以 `userId` 为过滤条件，越权访问一律 404，不区分“不存在”和“不是你的”
+- token 存 localStorage 而不是 Cookie：后端是独立的云函数域名，跨站 Cookie 需要 SameSite=None 且依赖网关配合；代价是 XSS 可读，依赖 React 转义兜底
 - 主密钥缺失或格式非法时拒绝保存，错误信息里直接给出生成命令；不会退化成明文落库。读到历史明文配置会在密钥可用时自动加密回写
 - 前端不直连 DeepSeek，密钥不进入浏览器
 - `fetch_url` 工具走 URL 校验（`security/url-guard.ts`）+ 超时与体积上限，防 SSRF 和超大响应；协议限制、域名黑名单、**字面量 IP 与 DNS 全量解析结果都不能落入内网**，且每跳重定向重新校验
@@ -229,11 +272,12 @@ SYSTEM_PROMPT / SUMMARY_PROMPT 从 service 里抽到 `chat/prompt.ts`，并导�
 
 | 文件 | 职责 |
 |------|------|
-| `frontend/src/client.ts` | 封装所有后端 HTTP/SSE 调用（含 `truncateConversation`） |
+| `frontend/src/client.ts` | 封装所有后端 HTTP/SSE 调用（含 `truncateConversation`）；统一管理 token（localStorage）与 `Authorization` 头，任一接口 401 时广播 `ai-chat:unauthorized` 让 App 收回登录态 |
 | `frontend/src/apiConfig.ts` | PROVIDER_PRESETS（给 Modal UI 渲染用）、表单校验工具 |
 | `frontend/src/types.ts` | Message / Conversation / ApiConfig / ProviderType 类型 |
-| `frontend/src/App.tsx` | 状态管理：对话列表、当前会话、配置状态、发送/停止；`rewindTo` 统一承载“重新生成”与“编辑重发”（先改后端再同步本地）；`pagehide`/卸载时 abort 在途 SSE |
-| `frontend/src/components/ChatInterface.tsx` | 纯 UI：侧栏 + 气泡 + 输入框 + Markdown 渲染 + 工具步骤面板；“重新生成”仅给最后一条回答，“编辑重发”仅给历史用户消息 |
+| `frontend/src/App.tsx` | 状态管理：登录态、对话列表、当前会话、配置状态、发送/停止；首屏用 token 换登录态，未登录只渲染 `AuthView`；登录后拉该账号配置，没配 Key 自动弹设置窗；`rewindTo` 统一承载“重新生成”与“编辑重发”（先改后端再同步本地）；`pagehide`/卸载时 abort 在途 SSE |
+| `frontend/src/components/AuthView.tsx` | 登录/注册页：模式切换、前置长度校验、错误提示（连不上后端翻译成启动命令提示）、提交中禁用按钮 |
+| `frontend/src/components/ChatInterface.tsx` | 纯 UI：侧栏 + 气泡 + 输入框 + Markdown 渲染 + 工具步骤面板；“重新生成”仅给最后一条回答，“编辑重发”仅给历史用户消息；顶栏展示当前账号与「退出登录」（生成中禁用） |
 | `frontend/src/components/ApiConfigModal.tsx` | 配置弹窗 UI：供应商选择 + Key/Model/BaseURL 表单 |
 
 ## 启动命令

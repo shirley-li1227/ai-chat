@@ -1,19 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import ApiConfigModal from './components/ApiConfigModal'
+import AuthView from './components/AuthView'
 import ChatInterface from './components/ChatInterface'
 import type { ApiConfig, Conversation, Message, ToolStep } from './types'
 import {
+  UNAUTHORIZED_EVENT,
   createConversation,
   deleteConversation as apiDeleteConversation,
   truncateConversation,
   fetchConfig,
   fetchConversation,
   fetchConversations,
+  fetchCurrentUser,
+  logoutUser,
+  setAuthToken,
   saveConfig,
   clearConfig,
   streamChat,
 } from './client'
-import type { ConfigResponse } from './client'
+import type { AuthSession, AuthUser, ConfigResponse } from './client'
 
 const BACKEND_DOWN = '无法连接到后端服务，请确认已启动 npm run dev:api'
 
@@ -25,6 +30,9 @@ function App() {
   const [configStatus, setConfigStatus] = useState<ConfigResponse | null>(null)
   const [hasConfig, setHasConfig] = useState(false)
   const [configModalOpen, setConfigModalOpen] = useState(false)
+  const [user, setUser] = useState<AuthUser | null>(null)
+  // 首屏要先拿 token 换登录态，其间既不该闪登录页也不该闪聊天页
+  const [booting, setBooting] = useState(true)
   const abortRef = useRef<AbortController | null>(null)
 
   /** 拉会话列表，没有就建一个；返回当前应使用的会话。 */
@@ -42,21 +50,81 @@ function App() {
     return conv
   }, [])
 
-  // Load config and conversations on mount
-  useEffect(() => {
-    const init = async () => {
-      try {
-        const cfg = await fetchConfig()
-        setConfigStatus(cfg)
-        setHasConfig(cfg !== null)
-        await loadConversations()
-      } catch {
-        // Backend not available yet
-        setErrorMessage(BACKEND_DOWN)
-      }
+  /** 清掉当前账号的一切界面状态，切账号/掉登录态都走这里，避免残留上一个账号的数据 */
+  const resetWorkspace = useCallback(() => {
+    setConversations([])
+    setActiveConversationId('')
+    setConfigStatus(null)
+    setHasConfig(false)
+    setConfigModalOpen(false)
+    setErrorMessage(null)
+  }, [])
+
+  // 登录后拉取该账号的配置与会话
+  const loadWorkspace = useCallback(async (): Promise<void> => {
+    resetWorkspace()
+    try {
+      const cfg = await fetchConfig()
+      setConfigStatus(cfg)
+      setHasConfig(cfg !== null)
+      // 没配 Key 就直接把弹窗摆出来：登录后要做的第一件事只有这一件
+      setConfigModalOpen(cfg === null)
+      await loadConversations()
+    } catch {
+      // Backend not available yet
+      setErrorMessage(BACKEND_DOWN)
     }
-    init()
-  }, [loadConversations])
+  }, [loadConversations, resetWorkspace])
+
+  // 首屏用本地 token 换回登录态；换不出用户就停在登录页
+  useEffect(() => {
+    let cancelled = false
+    const boot = async () => {
+      const me = await fetchCurrentUser().catch(() => null)
+      if (cancelled) {
+        return
+      }
+      setBooting(false)
+      if (!me) {
+        setUser(null)
+        return
+      }
+      setUser(me)
+      await loadWorkspace()
+    }
+    boot()
+    return () => {
+      cancelled = true
+    }
+  }, [loadWorkspace])
+
+  // 任一接口返回 401（token 过期或已在别处登出）：收回登录态，回登录页
+  useEffect(() => {
+    const onUnauthorized = () => {
+      setAuthToken(null)
+      setUser(null)
+      resetWorkspace()
+      abortRef.current?.abort()
+    }
+    window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized)
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized)
+  }, [resetWorkspace])
+
+  const handleSession = useCallback(
+    async (session: AuthSession) => {
+      setAuthToken(session.token)
+      setUser(session.user)
+      await loadWorkspace()
+    },
+    [loadWorkspace],
+  )
+
+  const handleLogout = useCallback(async () => {
+    abortRef.current?.abort()
+    await logoutUser()
+    setUser(null)
+    resetWorkspace()
+  }, [resetWorkspace])
 
   // Load messages when switching conversation
   useEffect(() => {
@@ -381,9 +449,26 @@ function App() {
     setConfigModalOpen(true)
   }, [])
 
+  if (booting) {
+    return (
+      <div className="flex min-h-screen items-center justify-center gap-2 bg-gradient-to-br from-slate-50 via-white to-emerald-50/70 text-sm text-slate-500">
+        <svg viewBox="0 0 24 24" className="h-4 w-4 animate-spin" fill="none" stroke="currentColor" strokeWidth="2.5">
+          <path d="M12 3a9 9 0 1 0 9 9" strokeLinecap="round" />
+        </svg>
+        正在恢复登录状态…
+      </div>
+    )
+  }
+
+  // 未登录时连聊天界面都不渲染，API Key 弹窗自然也只在登录之后才可能出现
+  if (!user) {
+    return <AuthView onSession={handleSession} />
+  }
+
   return (
     <>
       <ChatInterface
+        user={user}
         conversations={conversations}
         activeConversationId={activeConversationId}
         hasEmptyConversation={hasEmptyConversation}
@@ -400,6 +485,7 @@ function App() {
         onNewChat={handleNewChat}
         onSelectConversation={handleSelectConversation}
         onDeleteConversation={handleDeleteConversation}
+        onLogout={handleLogout}
       />
       <ApiConfigModal
         open={configModalOpen}
