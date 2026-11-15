@@ -141,8 +141,9 @@ function evaluateExpression(input: string): number {
       pos += numMatch[0].length
       return parseFloat(numMatch[0])
     }
-    // 函数与常量
-    const identMatch = /^[a-zA-Z_]+/.exec(src.slice(pos))
+    // 函数与常量：标识符必须允许数字，否则 log10/log2 会被切成 "log" + 数字，
+    // 报成"函数 log 需要括号参数"这种看不懂的错（评测集 calc-04 就是先撞在这里）
+    const identMatch = /^[a-zA-Z_][a-zA-Z_0-9]*/.exec(src.slice(pos))
     if (identMatch) {
       const name = identMatch[0].toLowerCase()
       pos += identMatch[0].length

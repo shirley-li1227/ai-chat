@@ -13,6 +13,8 @@
     "start:api": "npm --prefix functions/api run start:prod",
     "preview": "npm --prefix frontend run preview",
     "lint": "npm --prefix frontend run lint",
-    "typecheck": "npm --prefix functions/api run typecheck"
+    "typecheck": "npm --prefix functions/api run typecheck",
+    "eval": "npm --prefix functions/api run eval",
+    "eval:online": "npm --prefix functions/api run eval:online"
   }
 }

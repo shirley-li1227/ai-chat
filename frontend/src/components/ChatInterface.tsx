@@ -85,6 +85,10 @@ interface ChatInterfaceProps {
   onOpenConfig: () => void
   onStop?: () => void
   onSend: (content: string) => Promise<void> | void
+  /** 重新生成最后一轮回答 */
+  onRegenerate?: () => Promise<void> | void
+  /** 回退到该条消息之前并交回原文；返回 null 表示未成功，不应预填输入框 */
+  onEditMessage?: (message: Message) => Promise<string | null>
   onNewChat: () => void
   onSelectConversation: (conversationId: string) => void
   onDeleteConversation: (conversationId: string) => void
@@ -110,6 +114,8 @@ export default function ChatInterface({
   onOpenConfig,
   onStop,
   onSend,
+  onRegenerate,
+  onEditMessage,
   onNewChat,
   onSelectConversation,
   onDeleteConversation,
@@ -117,7 +123,10 @@ export default function ChatInterface({
   const [input, setInput] = useState('')
   const [copiedTimestamp, setCopiedTimestamp] = useState<number | null>(null)
   const [copyError, setCopyError] = useState<string | null>(null)
+  // 正在回退的消息时间戳：截断是异步的，不锁住会出现连点两次都删一次
+  const [rewindingTimestamp, setRewindingTimestamp] = useState<number | null>(null)
   const mainRef = useRef<HTMLElement | null>(null)
+  const inputRef = useRef<HTMLTextAreaElement | null>(null)
   const rafRef = useRef<number | null>(null)
   // 粘底标记：用户向上翻阅历史时暂停自动跟随，避免被强制拉回底部
   const stickToBottomRef = useRef(true)
@@ -126,6 +135,17 @@ export default function ChatInterface({
     () => input.trim().length > 0 && !isSending && hasConfig,
     [input, isSending, hasConfig],
   )
+
+  // 只有最后一条回答提供“重新生成”：早期回答往回重生会一并丢掉之后的上下文，
+  // 属于影响较大的操作，不放到每个气泡上避免误点
+  const lastAssistantTimestamp = useMemo(() => {
+    for (let index = messages.length - 1; index >= 0; index--) {
+      if (messages[index].role === 'assistant') {
+        return messages[index].timestamp
+      }
+    }
+    return null
+  }, [messages])
 
   // 流式输出时每个 chunk 都会改变 messages，若逐次触发平滑滚动会相互打断产生抖动。
   // 这里按帧合并为一次瞬时定位，只滚动容器自身而不影响祖先滚动。
@@ -204,6 +224,32 @@ export default function ChatInterface({
       }, 1500)
     } catch {
       setCopyError('复制失败，请手动复制。')
+    }
+  }
+
+  const handleRegenerate = async () => {
+    if (!onRegenerate || isSending || rewindingTimestamp !== null) {
+      return
+    }
+    // 重生会开启新一轮输出，重新贴底否则新回答在屏外
+    stickToBottomRef.current = true
+    await onRegenerate()
+  }
+
+  const handleEdit = async (message: Message) => {
+    if (!onEditMessage || isSending || rewindingTimestamp !== null) {
+      return
+    }
+
+    setRewindingTimestamp(message.timestamp)
+    try {
+      const content = await onEditMessage(message)
+      if (content !== null) {
+        setInput(content)
+        inputRef.current?.focus()
+      }
+    } finally {
+      setRewindingTimestamp(null)
     }
   }
 
@@ -451,6 +497,26 @@ export default function ChatInterface({
                           {copiedTimestamp === message.timestamp ? '已复制' : '复制'}
                         </button>
                       ) : null}
+                      {isUser ? (
+                        <button
+                          type="button"
+                          onClick={() => handleEdit(message)}
+                          disabled={isSending || !hasConfig || rewindingTimestamp !== null}
+                          className="rounded-md px-1.5 py-0.5 text-xs text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
+                        >
+                          {rewindingTimestamp === message.timestamp ? '回退中…' : '编辑重发'}
+                        </button>
+                      ) : null}
+                      {!isUser && message.timestamp === lastAssistantTimestamp ? (
+                        <button
+                          type="button"
+                          onClick={handleRegenerate}
+                          disabled={isSending || !hasConfig || rewindingTimestamp !== null}
+                          className="rounded-md px-1.5 py-0.5 text-xs text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
+                        >
+                          重新生成
+                        </button>
+                      ) : null}
                     </div>
                   </div>
                 </div>
@@ -461,6 +527,7 @@ export default function ChatInterface({
           <form onSubmit={handleSubmit} className="border-t border-slate-200/70 bg-white/80 p-4 backdrop-blur-sm">
             <div className="flex items-end gap-2 rounded-2xl border border-slate-200 bg-white p-2 shadow-sm">
             <textarea
+              ref={inputRef}
               value={input}
               onChange={(event) => setInput(event.target.value)}
               onKeyDown={handleInputKeyDown}

@@ -5,11 +5,14 @@
 ## 功能特性
 
 - 流式输出：AI 回答逐字显示（SSE）
-- 多轮对话：自动携带历史消息上下文
+- 多轮对话：自动携带历史消息上下文，可按 token 预算滑窗裁剪
 - 多会话管理：创建、切换、删除对话
+- 多轮管理：最后一轮可「重新生成」，历史提问可「编辑重发」（回退到该条再重来）
 - Markdown 渲染：支持 GFM 表格、任务列表、代码高亮
 - API 配置弹窗：运行时填写大模型 API Key，无需重启
 - Agent 工具调用：内置时间查询、精确计算、网页抓取三类工具，模型自主调用并在气泡中展示执行步骤
+- 工具并发：同一轮多个 tool_calls 并发执行（可封顶并发度），结果按原顺序回填
+- 提示词版本化：集中定义 + `PROMPT_VERSION` 随 `/api/health` 暴露，附 21 条离线回归用例
 - 后端持久化：对话历史与配置落库（本地 sql.js/SQLite，云端可切 PostgreSQL）
 - 安全设计：API Key 仅存后端，AES-256-GCM 加密后落库，接口只返回脱敏值
 
@@ -78,9 +81,14 @@ ai-chat/
 │       │   ├── config/         # API 配置 CRUD（加密落库 / 明文迁移）
 │       │   ├── conversations/  # 对话 & 消息实体/服务
 │       │   ├── chat/           # SSE 代理转发大模型 + Agent 多轮工具循环
-│       │   ├── agent/          # 工具定义与执行（时间 / 计算 / 网页抓取）
-│       │   ├── security/       # AES-256-GCM 加解密、URL 白名单
-│       │   └── health/         # 探活接口
+│       │   │   ├── prompt.ts           # 系统/摘要提示词 + PROMPT_VERSION
+│       │   │   ├── token-estimator.ts  # token 估算与滑窗裁剪
+│       │   │   ├── context-summarizer.ts # 旧轮次的滚动摘要
+│       │   │   └── llm-client.ts       # baseUrl 归一 + 非流式内部调用
+│       │   ├── agent/          # 工具定义与执行（时间 / 计算 / 网页抓取）+ 并发执行器
+│       │   ├── security/       # AES-256-GCM 加解密、URL 内网拦截
+│       │   └── health/         # 探活接口（含 promptVersion）
+│       ├── evals/              # 提示词/工具回归集与运行脚本（不随函数包上传）
 │       ├── dist/               # 构建产物，云函数实际执行的代码
 │       ├── data/               # SQLite 数据库文件（仅本地，自动创建）
 │       ├── scf_bootstrap       # HTTP 云函数启动入口（LF，监听 9000）
@@ -118,12 +126,12 @@ CloudBase HTTP 网关 ── 路径透传 /api/*；安全域名注入 CORS 并�
   ▼
 HTTP 云函数 api（scf_bootstrap → NestJS :9000）
   ├─ /api/config | /api/conversations | /api/health  → TypeORM
-  └─ /api/chat (SSE) → 存 user message → 读历史 + 注入 system prompt
-                       → fetch DeepSeek（stream + tools，最多 MAX_TURNS 轮）
+  └─ /api/chat (SSE) → 存 user message → 按 token 预算裁剪历史（旧轮次进摘要）
+                       → 注入 system prompt → fetch DeepSeek（stream + tools，最多 MAX_TURNS 轮）
                        → 透传 content / tool 事件 → 存 assistant message
 ```
 
-一次对话的事件顺序：`tool(calling)` → `tool(done)` …（0 次或多次）→ `content` 逐字 → `notice?`（截断提示）或 `error` → `data: [DONE]`。
+一次对话的事件顺序：`tool(calling)`×N → `tool(done)`×N（同一轮多个工具**并发执行**，calling 先全部发出，done 按 `tool_calls` 原顺序回填）→ `content` 逐字 → `notice?`（截断提示）或 `error` → `data: [DONE]`。
 
 ## 构建生产包
 
@@ -135,6 +143,20 @@ npm run build
 npm run build:frontend   # → frontend/dist
 npm run build:api        # → functions/api/dist
 ```
+
+## 回归评测
+
+提示词改一个字，工具命中率就可能变。`functions/api/evals/` 是一份可重跑的固定集，用来把“我优化了提示词”变成可比较的数字。
+
+```bash
+npm run eval                      # 离线：先 build 再断言，不需要网络与 API Key
+$env:EVAL_API_KEY="sk-..."; npm run eval:online   # 在线：真实调模型，会消耗 token
+npm run eval:online -- --min-accuracy=0.9         # 卡命中率下限，低于阈值退出码非 0
+```
+
+- **离线（默认）**：21 条用例直接调用编译产物里的 `executeTool`，断言计算结果、参数缺失/非法表达式异常、时间输出格式、SSRF 护栏（元数据端点/回环/私网/非 http 协议必须被拒）；外加几个结构不变量：提示词与工具定义对齐、`PROMPT_VERSION` 与用例钉住的版本一致、`planWindow` 保留最新后缀且永不丢弃最新一条、并发上限与保序。改完代码随手跑。
+- **在线（`--online`）**：非流式 + `tool_choice: auto`，只看模型选了哪个工具（不判正文），输出按分类统计命中率。缺 `EVAL_API_KEY` 时直接报错退出，不会静默“通过”。
+- 用例集里 `promptVersion` 与 `src/chat/prompt.ts` 不一致时评测直接失败：升提示词版本必须同时确认预期，两边不会越漂越远。
 
 ## 云端部署（腾讯云 CloudBase）
 
@@ -195,9 +217,10 @@ tcb hosting deploy frontend/dist / -e <envId>    # 前端产物上传到托管�
 ### 上线验收
 
 ```bash
-curl https://<envId>.service.tcloudbase.com/api/health    # 200，database: up / encryption: enabled
+curl https://<envId>.service.tcloudbase.com/api/health    # 200：database: up / encryption: enabled / promptVersion 为当前提示词版本
 curl https://<envId>.service.tcloudbase.com/api/config    # 200 {"configured": ...}
 curl -X POST https://<envId>.service.tcloudbase.com/api/chat -H "Content-Type: application/json" --data @body.json   # 未配 Key 时是 400 友好提示，不是 404
+curl -X POST https://<envId>.service.tcloudbase.com/api/conversations/<id>/truncate -H "Content-Type: application/json" --data "{\"fromTimestamp\":1}"
 ```
 
 - `encryption: disabled` 说明 `ENCRYPTION_KEY` 注入失败，保存 API Key 会返回 400
@@ -220,4 +243,6 @@ curl -X POST https://<envId>.service.tcloudbase.com/api/chat -H "Content-Type: a
 - 前端 Vite HMR 即时更新；修改 `frontend/vite.config.ts` 需重启前端
 - 本地 SQLite 数据库文件位于 `functions/api/data/app.db`，首次启动自动创建表结构（synchronize: true）
 - API Key 以密文落库（前缀 `gcm1:`），接口只返回脱敏值 `apiKeyMasked`，明文仅在调用上游时内存中存在
-- 改了后端 `src` 必须 `npm run build:api` 再 `tcb fn deploy`：`ignore` 排除了 `src`，云端跑的是包内 `dist/`
+- 改了后端 `src` 必须 `npm run build:api` 再 `tcb fn deploy`：`ignore` 排除了 `src` 与 `evals`，云端跑的是包内 `dist/`（仅在明确要求时才发布）
+- 改提示词要同时升 `PROMPT_VERSION` 并跑 `npm run eval`，否则版本不一致会直接判失败；仅注释/空白调整不必升版本
+- 上下文窗口、工具并发、摘要开关分别由 `CONTEXT_TOKEN_BUDGET`、`AGENT_TOOL_CONCURRENCY`、`CONTEXT_SUMMARY_ENABLED` 控制，见 `functions/api/.env.example` 与 `cloudbaserc.json`

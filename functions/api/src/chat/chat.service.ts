@@ -3,28 +3,37 @@ import { ConfigService } from '../config/config.service'
 import { ConversationsService } from '../conversations/conversations.service'
 import { Response } from 'express'
 import { TOOL_DEFINITIONS, executeTool } from '../agent/tools'
-
-const SYSTEM_PROMPT = `你是一位友善、专业的 AI 助手，具备调用外部工具的能力。
-
-## 工具使用准则
-1. 你可以调用 get_current_time、calculator、fetch_url 等工具。是否调用、调用哪个、调用几次，完全由你自主判断。
-2. 涉及算术运算必须用 calculator，禁止心算；询问当前时间必须用 get_current_time，禁止凭记忆推测；需要网页上的实时信息用 fetch_url。
-3. 若一次工具返回不足以回答，可继续调用其他工具，逐步收敛后再作答；不要编造工具未返回的内容。
-4. 工具返回错误或结果异常时，应说明原因并尝试调整参数重试，而不是直接放弃。
-5. 不需要工具的问题（闲聊、写作、开放讨论）直接回答，不要为了调用而调用。
-
-## 输出格式规范
-1. 使用 Markdown 组织回答；代码块必须带语言标记（如 \`\`\`python）。
-2. 输出表格时，务必严格遵守 GFM 表格语法：
-   - 每行表格数据独占一行，行末必须使用换行符 \\n 结束；
-   - 分隔行（形如 |---|---|）紧跟在表头下方，不允许与表头挤在同一行；
-   - 单元格之间使用竖线 | 分隔，不要在行内追加多余空格；
-   - 严禁把整张表格压缩到一行内。
-3. 列表、标题、段落之间也要保持正常换行，避免所有内容连成一片。
-4. 回答力求简洁清晰，如信息不足或存在多种可能，请主动说明。`
+import type { PlainApiConfig } from '../config/config.service'
+import { runWithConcurrency } from '../agent/tool-runner'
+import { SYSTEM_PROMPT } from './prompt'
+import { resolveCompletionsUrl } from './llm-client'
+import { buildRollingSummary } from './context-summarizer'
+import { estimateTokens, planWindow } from './token-estimator'
 
 // 单次请求内 Agent 工具调用的最大迭代次数，防止模型陷入无限循环消耗额度
 const MAX_TURNS = Number(process.env.AGENT_MAX_TURNS ?? 6)
+
+/**
+ * 一轮 tool_calls 内并发执行的工具数上限。
+ * 必须封顶：模型一次返回十几个 fetch_url 完全可能，不设上限就等于
+ * 让模型决定实例的出站连接数，在 256MB 内存的云函数里很容易失控。
+ */
+const TOOL_CONCURRENCY = Math.max(
+  1,
+  Number(process.env.AGENT_TOOL_CONCURRENCY ?? 4),
+)
+
+/** 历史消息可用的 token 预算（不含 system 与摘要本身） */
+const CONTEXT_TOKEN_BUDGET = Math.max(
+  1000,
+  Number(process.env.CONTEXT_TOKEN_BUDGET ?? 6000),
+)
+
+/** 窗口下限：哪怕摘要再长，也要保证至少带得走最近一问 */
+const CONTEXT_MIN_TOKENS = 800
+
+/** 关掉则退回“只裁剪不压缩”，用于对比测试或排障 */
+const CONTEXT_SUMMARY_ENABLED = process.env.CONTEXT_SUMMARY_ENABLED !== 'false'
 
 interface ToolCall {
   id: string
@@ -100,6 +109,63 @@ export class ChatService {
     return expanded
   }
 
+  /**
+   * 组装本轮要发送的历史：最近若干轮原文 + 更早内容的滚动摘要。
+   *
+   * 摘要边界（summaryUntil）随裁剪一起推进，因此同一段旧对话不会被反复压缩，
+   * 也不会既出现在摘要里又原文重发。
+   */
+  private async buildContext(
+    config: PlainApiConfig,
+    conversationId: string,
+    signal?: AbortSignal,
+  ): Promise<{ historyMessages: OutboundMessage[]; summary: string | null }> {
+    const ctx = await this.conversationsService.loadContext(conversationId)
+    const messages = ctx.messages
+      .filter((m) => m.role === 'user' || m.role === 'assistant')
+      .map((m) => ({
+        role: m.role,
+        content: m.content,
+        timestamp: m.timestamp,
+        toolCalls: m.toolCalls ?? null,
+      }))
+
+    // 摘要正文自己也要吃额度，先扣掉它实际占用的部分再算窗口
+    const priorSummary = ctx.summary
+    const budget = Math.max(
+      CONTEXT_MIN_TOKENS,
+      CONTEXT_TOKEN_BUDGET - estimateTokens(priorSummary ?? ''),
+    )
+    const { kept, dropped } = planWindow(messages, budget)
+
+    const expand = (list: typeof kept) =>
+      list.flatMap((m) => this.expandHistory(m))
+
+    if (!dropped.length) {
+      return { historyMessages: expand(kept), summary: priorSummary }
+    }
+
+    if (!CONTEXT_SUMMARY_ENABLED) {
+      // 只丢不压：旧内容直接退出上下文，代价是模型失去早期记忆
+      this.logger.warn(`上下文超预算，已丢弃 ${dropped.length} 条更早消息（摘要开关已关闭）`)
+      return { historyMessages: expand(kept), summary: priorSummary }
+    }
+
+    const nextSummary = await buildRollingSummary(
+      config,
+      {
+        priorSummary,
+        // 工具轨迹不进摘要：它的结论已经体现在 assistant 正文里，重复计入只会推高成本
+        dropped: dropped.map((m) => ({ role: m.role, content: m.content })),
+      },
+      signal,
+    )
+    const boundary = dropped[dropped.length - 1].timestamp
+    await this.conversationsService.saveContext(conversationId, nextSummary, boundary)
+
+    return { historyMessages: expand(kept), summary: nextSummary }
+  }
+
   async streamChat(
     conversationId: string,
     content: string,
@@ -117,23 +183,29 @@ export class ChatService {
     // 保存用户消息
     await this.conversationsService.addMessage(conversationId, 'user', content)
 
-    // 读取会话上下文，含历史工具轨迹
-    const conversation = await this.conversationsService.findOne(conversationId)
-    const historyMessages = conversation.messages
-      .filter((m) => m.role === 'user' || m.role === 'assistant')
-      .flatMap((m) =>
-        this.expandHistory({ role: m.role, content: m.content, toolCalls: m.toolCalls ?? null }),
-      )
+    // 读取会话上下文：最近若干轮发原文，更早的内容走滚动摘要
+    const { historyMessages, summary } = await this.buildContext(
+      config,
+      conversationId,
+      signal,
+    )
 
     const messages: OutboundMessage[] = [
       { role: 'system', content: SYSTEM_PROMPT },
+      ...(summary
+        ? [
+            {
+              role: 'system',
+              content:
+                '以下是本对话更早内容的摘要，请当作已知事实使用，不要向用户复述摘要本身：\n' +
+                summary,
+            },
+          ]
+        : []),
       ...historyMessages,
     ]
 
-    const baseUrl = config.baseUrl.trim().replace(/\/+$/, '')
-    const url = /\/chat\/completions$/i.test(baseUrl)
-      ? baseUrl
-      : `${baseUrl}/chat/completions`
+    const url = resolveCompletionsUrl(config.baseUrl)
 
     const steps: StoredStep[] = []
 
@@ -194,10 +266,12 @@ export class ChatService {
           // 回填 assistant 的 tool_calls，供下一轮请求使用
           messages[messages.length - 1].tool_calls = calls
 
-          for (const call of calls) {
-            let parsedArgs: Record<string, unknown> = {}
+          // 先统一登记步骤并发 calling 事件，再并发执行：
+          // 展示顺序不再取决于执行顺序，前端靠 tool_call_id 对位更新
+          const prepared = calls.map((call) => {
+            let args: Record<string, unknown> = {}
             try {
-              parsedArgs = JSON.parse(call.function.arguments) as Record<string, unknown>
+              args = JSON.parse(call.function.arguments) as Record<string, unknown>
             } catch {
               this.logger.warn(`工具参数解析失败: ${call.function.arguments}`)
             }
@@ -212,31 +286,50 @@ export class ChatService {
                 ok: false,
               })
               sendEvent({
-                tool: { id: call.id, name: call.function.name, args: parsedArgs, status: 'calling' },
+                tool: { id: call.id, name: call.function.name, args, status: 'calling' },
               })
             }
 
-            const result = await executeTool(call.function.name, parsedArgs)
+            return { call, args }
+          })
+
+          // executeTool 内部已吃掉异常，这里的失败分支只为未来可能 reject 的工具兼容
+          const outcomes = await runWithConcurrency(
+            prepared,
+            TOOL_CONCURRENCY,
+            ({ call, args }) => executeTool(call.function.name, args),
+          )
+
+          // 结果按 calls 原顺序回填，保证 tool 消息与 tool_calls 一一对应
+          for (let i = 0; i < prepared.length; i++) {
+            const { call, args } = prepared[i]
+            const outcome = outcomes[i]
+            const ok = outcome.ok === true ? outcome.value.ok : false
+            const output =
+              outcome.ok === true
+                ? outcome.value.output
+                : `工具执行异常：${(outcome.reason as Error)?.message ?? String(outcome.reason)}`
+
             const recorded = steps.find((s) => s.id === call.id)
             if (recorded) {
-              recorded.result = result.output
-              recorded.ok = result.ok
+              recorded.result = output
+              recorded.ok = ok
             }
 
             sendEvent({
               tool: {
                 id: call.id,
                 name: call.function.name,
-                args: parsedArgs,
-                status: result.ok ? 'done' : 'error',
-                result: result.output,
+                args,
+                status: ok ? 'done' : 'error',
+                result: output,
               },
             })
 
             messages.push({
               role: 'tool',
               tool_call_id: call.id,
-              content: result.output,
+              content: output,
             })
           }
           // 继续下一轮，让模型基于工具结果作答

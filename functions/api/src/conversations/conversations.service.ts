@@ -1,8 +1,15 @@
 import { Injectable, NotFoundException } from '@nestjs/common'
 import { InjectRepository } from '@nestjs/typeorm'
-import { Repository } from 'typeorm'
+import { MoreThanOrEqual, Repository } from 'typeorm'
 import { Conversation } from './conversation.entity'
 import { Message } from './message.entity'
+
+/** 一次请求需要的全部上下文状态 */
+export interface ConversationContext {
+  messages: Message[]
+  summary: string | null
+  summaryUntil: number | null
+}
 
 @Injectable()
 export class ConversationsService {
@@ -65,6 +72,86 @@ export class ConversationsService {
       throw new NotFoundException('对话不存在')
     }
     await this.convRepo.remove(conv)
+  }
+
+  /**
+   * 一次性取回裁剪上下文所需的全部信息，避免 ChatService 为了算窗口再跑一次查询。
+   */
+  async loadContext(id: string): Promise<ConversationContext> {
+    const conv = await this.convRepo.findOne({
+      where: { id },
+      relations: { messages: true },
+    })
+    if (!conv) {
+      throw new NotFoundException('对话不存在')
+    }
+    const messages = [...conv.messages].sort((a, b) => a.timestamp - b.timestamp)
+    return {
+      messages,
+      summary: conv.contextSummary ?? null,
+      summaryUntil: conv.summaryUntil ?? null,
+    }
+  }
+
+  /**
+   * 写入滚动摘要。摘要没变时不写，否则 UpdateDateColumn 会无意义地推后 updatedAt，
+   * 前端会话列表排序会因此跳动。
+   */
+  async saveContext(
+    id: string,
+    summary: string,
+    summaryUntil: number,
+  ): Promise<void> {
+    const conv = await this.convRepo.findOne({ where: { id } })
+    if (!conv) {
+      return
+    }
+    if (conv.contextSummary === summary && conv.summaryUntil === summaryUntil) {
+      return
+    }
+    conv.contextSummary = summary
+    conv.summaryUntil = summaryUntil
+    await this.convRepo.save(conv)
+  }
+
+  /**
+   * 截断到某条消息之前：删除 timestamp >= fromTimestamp 的全部消息。
+   *
+   * “重新生成”和“编辑重发”都建立在这个操作上：两者本质都是“回到某个时刻重来”。
+   * 按时间戳而不是消息 id 删除，是因为前端列表本来就以 timestamp 为 key，
+   * 两边用同一套坐标系不容易错位。
+   *
+   * 摘要一致性：若旧摘要已经覆盖了被删的消息（summaryUntil >= fromTimestamp），
+   * 摘要里就会残留根本不存在的对话，必须一并作废重新开始。
+   */
+  async truncateFrom(
+    id: string,
+    fromTimestamp: number,
+  ): Promise<{ removed: number; summaryReset: boolean }> {
+    const conv = await this.convRepo.findOne({ where: { id } })
+    if (!conv) {
+      throw new NotFoundException('对话不存在')
+    }
+
+    const doomed = await this.msgRepo.find({
+      where: {
+        conversation: { id },
+        timestamp: MoreThanOrEqual(fromTimestamp),
+      },
+    })
+    if (doomed.length) {
+      await this.msgRepo.remove(doomed)
+    }
+
+    let summaryReset = false
+    if (conv.summaryUntil !== null && conv.summaryUntil >= fromTimestamp) {
+      conv.contextSummary = null
+      conv.summaryUntil = null
+      await this.convRepo.save(conv)
+      summaryReset = true
+    }
+
+    return { removed: doomed.length, summaryReset }
   }
 
   async addMessage(

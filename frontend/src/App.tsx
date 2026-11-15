@@ -5,6 +5,7 @@ import type { ApiConfig, Conversation, Message, ToolStep } from './types'
 import {
   createConversation,
   deleteConversation as apiDeleteConversation,
+  truncateConversation,
   fetchConfig,
   fetchConversation,
   fetchConversations,
@@ -233,6 +234,77 @@ function App() {
     abortRef.current?.abort()
   }
 
+  /**
+   * 把会话回退到某条消息之前：先改后端，再同步本地状态。
+   * 顺序不能反——本地先删、后端失败，会留下“界面没了、库里还在”的不一致，
+   * 刷新后消息复活，比什么都不做更让人困惑。
+   */
+  const rewindTo = async (conversationId: string, messageTimestamp: number) => {
+    await truncateConversation(conversationId, messageTimestamp)
+    setConversations((prev) =>
+      prev.map((conversation) =>
+        conversation.id === conversationId
+          ? {
+              ...conversation,
+              messages: conversation.messages.filter(
+                (message) => message.timestamp < messageTimestamp,
+              ),
+              updatedAt: Date.now(),
+            }
+          : conversation,
+      ),
+    )
+  }
+
+  /**
+   * 重新生成：连同上一条用户消息一起回退再原样重发。
+   * 若只删 assistant 回答、保留 user 消息，重发会让同一句话在库里出现两遍，
+   * 下一轮上下文因此多出一条重复提问。
+   */
+  const handleRegenerate = async () => {
+    if (!activeConversation || isSending || !hasConfig) {
+      return
+    }
+
+    const lastUserMessage = [...activeConversation.messages]
+      .reverse()
+      .find((message) => message.role === 'user')
+    if (!lastUserMessage) {
+      return
+    }
+
+    setErrorMessage(null)
+    try {
+      await rewindTo(activeConversation.id, lastUserMessage.timestamp)
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '回退对话失败')
+      return
+    }
+
+    // 截断后走正常发送流程：用户消息会重新落库，回答也是全新一条
+    await handleSend(lastUserMessage.content)
+  }
+
+  /**
+   * 编辑重发：回退到该条用户消息之前，把原文交回输入框由用户改。
+   * 这里只返回内容、不直接操作输入框，是为了让 input 状态继续由 ChatInterface 持有。
+   */
+  const handleEditMessage = async (message: Message): Promise<string | null> => {
+    if (isSending || message.role !== 'user' || !activeConversationId) {
+      return null
+    }
+
+    setErrorMessage(null)
+    try {
+      await rewindTo(activeConversationId, message.timestamp)
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '回退对话失败')
+      return null
+    }
+
+    return message.content
+  }
+
   const handleNewChat = async () => {
     if (hasEmptyConversation) {
       const emptyConversation = conversations.find((conversation) => conversation.messages.length === 0)
@@ -311,6 +383,8 @@ function App() {
         onOpenConfig={handleOpenConfig}
         onStop={handleStop}
         onSend={handleSend}
+        onRegenerate={handleRegenerate}
+        onEditMessage={handleEditMessage}
         onNewChat={handleNewChat}
         onSelectConversation={handleSelectConversation}
         onDeleteConversation={handleDeleteConversation}

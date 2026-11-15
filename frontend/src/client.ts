@@ -152,6 +152,30 @@ export async function deleteConversation(id: string): Promise<void> {
   await fetch(`${BASE}/conversations/${id}`, { method: 'DELETE' })
 }
 
+/**
+ * 回到某个时刻：删除 fromTimestamp 及之后的消息。
+ * “重新生成”与“编辑重发”都靠它把上下文退回去，再走正常发送流程重新落库。
+ */
+export async function truncateConversation(
+  id: string,
+  fromTimestamp: number,
+): Promise<void> {
+  const res = await fetch(`${BASE}/conversations/${id}/truncate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fromTimestamp }),
+  })
+  if (!res.ok) {
+    const data = (await res.json().catch(() => null)) as
+      | { message?: string | string[] }
+      | null
+    // Nest 校验失败时 message 是数组，不拼起来会弹成 [object Object]
+    const raw = data?.message
+    const detail = Array.isArray(raw) ? raw.join('；') : raw
+    throw new Error(detail ?? '回退对话失败')
+  }
+}
+
 // --- Chat (SSE stream) ---
 
 export async function streamChat(

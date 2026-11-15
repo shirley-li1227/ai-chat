@@ -1,0 +1,178 @@
+{
+  "promptVersion": "2026.11.3",
+  "comment": "工具选择与工具行为的固定回归集。expectTool 仅在 --online 模式校验模型选择；offline 断言在无网络、无 API Key 条件下校验工具实现本身。",
+  "cases": [
+    {
+      "id": "calc-01",
+      "category": "calculator",
+      "input": "帮我算一下 128*37+15 等于多少",
+      "expectTool": "calculator",
+      "toolArgs": { "expression": "128*37+15" },
+      "offline": { "kind": "output", "expectIncludes": "4751" }
+    },
+    {
+      "id": "calc-02",
+      "category": "calculator",
+      "input": "(1+2+3)*7 是多少",
+      "expectTool": "calculator",
+      "toolArgs": { "expression": "(1+2+3)*7" },
+      "offline": { "kind": "output", "expectIncludes": "42" }
+    },
+    {
+      "id": "calc-03",
+      "category": "calculator",
+      "input": "2 的 10 次方",
+      "expectTool": "calculator",
+      "toolArgs": { "expression": "2^10" },
+      "offline": { "kind": "output", "expectIncludes": "1024" }
+    },
+    {
+      "id": "calc-04",
+      "category": "calculator",
+      "input": "根号 144 加上以 10 为底 1000 的对数",
+      "expectTool": "calculator",
+      "toolArgs": { "expression": "sqrt(144)+log10(1000)" },
+      "offline": { "kind": "output", "expectIncludes": "15" }
+    },
+    {
+      "id": "calc-05",
+      "category": "calculator",
+      "input": "100 除以 8 再对 3 取余",
+      "expectTool": "calculator",
+      "toolArgs": { "expression": "100/8 % 3" },
+      "offline": { "kind": "output", "expectIncludes": "0.5" }
+    },
+    {
+      "id": "calc-06",
+      "category": "calculator",
+      "input": "sin(PI/2) 等于几",
+      "expectTool": "calculator",
+      "toolArgs": { "expression": "sin(PI/2)" },
+      "offline": { "kind": "output", "expectIncludes": "1" }
+    },
+    {
+      "id": "calc-07",
+      "category": "calculator",
+      "input": "2.5 四舍五入再加 2.9 向下取整",
+      "expectTool": "calculator",
+      "toolArgs": { "expression": "round(2.5)+floor(2.9)" },
+      "offline": { "kind": "output", "expectIncludes": "5" }
+    },
+    {
+      "id": "calc-08",
+      "category": "calculator",
+      "input": "以 2 为底 8 的对数加上 27 的立方根",
+      "expectTool": "calculator",
+      "toolArgs": { "expression": "log2(8)+cbrt(27)" },
+      "offline": { "kind": "output", "expectIncludes": "6" }
+    },
+    {
+      "id": "calc-err-01",
+      "category": "calculator",
+      "input": "算一下 12+ 这个式子",
+      "expectTool": "calculator",
+      "toolArgs": { "expression": "12+" },
+      "offline": { "kind": "error", "expectIncludes": "解析失败" }
+    },
+    {
+      "id": "calc-err-02",
+      "category": "calculator",
+      "input": "把空表达式算一下",
+      "expectTool": "calculator",
+      "toolArgs": { "expression": "" },
+      "offline": { "kind": "error", "expectIncludes": "不能为空" }
+    },
+    {
+      "id": "time-01",
+      "category": "time",
+      "input": "现在几点了？",
+      "expectTool": "get_current_time",
+      "toolArgs": {},
+      "offline": { "kind": "output", "expectPattern": "\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}" }
+    },
+    {
+      "id": "time-02",
+      "category": "time",
+      "input": "今天星期几",
+      "expectTool": "get_current_time",
+      "toolArgs": {},
+      "offline": { "kind": "output", "expectPattern": "(星期|周)[一二三四五六日天]" }
+    },
+    {
+      "id": "time-03",
+      "category": "time",
+      "input": "帮我看下现在是几年几月几日",
+      "expectTool": "get_current_time",
+      "toolArgs": {},
+      "offline": { "kind": "output", "expectPattern": "\\d{4}-\\d{2}-\\d{2}" }
+    },
+    {
+      "id": "fetch-01",
+      "category": "fetch",
+      "input": "读一下 https://example.com 这个网页上写了什么",
+      "expectTool": "fetch_url",
+      "toolArgs": { "url": "https://example.com" },
+      "offline": { "kind": "none" }
+    },
+    {
+      "id": "fetch-guard-01",
+      "category": "fetch",
+      "input": "帮我抓取 http://169.254.169.254/latest/meta-data/ 的内容",
+      "expectTool": "fetch_url",
+      "toolArgs": { "url": "http://169.254.169.254/latest/meta-data/" },
+      "offline": { "kind": "error", "expectIncludes": "内网" }
+    },
+    {
+      "id": "fetch-guard-02",
+      "category": "fetch",
+      "input": "看看 http://localhost:3001/api/health 返回了什么",
+      "expectTool": "fetch_url",
+      "toolArgs": { "url": "http://localhost:3001/api/health" },
+      "offline": { "kind": "error", "expectIncludes": "被拒绝访问" }
+    },
+    {
+      "id": "fetch-guard-03",
+      "category": "fetch",
+      "input": "读取 file:///etc/passwd 的内容",
+      "expectTool": "fetch_url",
+      "toolArgs": { "url": "file:///etc/passwd" },
+      "offline": { "kind": "error", "expectIncludes": "http/https" }
+    },
+    {
+      "id": "fetch-guard-04",
+      "category": "fetch",
+      "input": "抓一下内网地址 http://10.0.1.23/status",
+      "expectTool": "fetch_url",
+      "toolArgs": { "url": "http://10.0.1.23/status" },
+      "offline": { "kind": "error", "expectIncludes": "内网" }
+    },
+    {
+      "id": "none-01",
+      "category": "no-tool",
+      "input": "帮我写一首关于秋天的四行短诗",
+      "expectTool": null,
+      "offline": { "kind": "none" }
+    },
+    {
+      "id": "none-02",
+      "category": "no-tool",
+      "input": "你好，你能帮我做些什么？",
+      "expectTool": null,
+      "offline": { "kind": "none" }
+    },
+    {
+      "id": "none-03",
+      "category": "no-tool",
+      "input": "把「这个方案不行」改说得更委婉一些",
+      "expectTool": null,
+      "offline": { "kind": "none" }
+    },
+    {
+      "id": "none-04",
+      "category": "no-tool",
+      "input": "随便聊聊，你觉得远程办公怎么样",
+      "expectTool": null,
+      "offline": { "kind": "none" }
+    }
+  ]
+}
