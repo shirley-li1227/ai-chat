@@ -39,7 +39,7 @@
 
 ```
 浏览器  https://<envId>-<appid>.tcloudbaseapp.com   （CloudBase 静态托管，写在托管桶根目录）
-  │  fetch https://<envId>.service.tcloudbase.com/api/*   ← 跨域，BASE 写死在 client.ts
+  │  fetch https://<envId>.service.tcloudbase.com/api/*   ← 跨域，BASE 来自 VITE_API_BASE（frontend/.env.production）
   ▼
 CloudBase HTTP 网关
   ├─ 路由 /api：enablePathTransmission=true（后端自带 /api 前缀，剥掉就全量 404）

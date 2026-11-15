@@ -1,8 +1,8 @@
 import type { ApiConfig, Conversation, ToolStep } from './types'
 
-// 直接写死后端访问地址：CloudBase HTTP 云函数 service 域名 + /api 网关路径
-// 前端静态托管域名与函数域名不同源，必须用绝对地址（后端需相应放行 CORS）
-const BASE = 'https://lucky-lxy-d1g5yv28gd1a13d29.service.tcloudbase.com/api'
+// 同源部署时留空走相对路径；前后端分域时通过 VITE_API_BASE 指定绝对地址
+// 本地开发走相对 /api，由 vite.config.ts 代理到 http://localhost:3001
+const BASE = (import.meta.env.VITE_API_BASE ?? '').replace(/\/+$/, '') || '/api'
 
 // --- Config ---
 

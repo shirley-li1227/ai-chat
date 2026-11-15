@@ -21,7 +21,7 @@ export class Conversation {
    * 摘要已覆盖到的消息时间戳（含）。时间戳 <= 该值的消息视为“已在摘要里”，
    * 后续裁剪时可直接跳过，避免同一段对话既在摘要里又在窗口里重复发送。
    */
-  @Column({ nullable: true })
+  @Column({ type: Number, nullable: true })
   summaryUntil: number | null
 
   @CreateDateColumn()

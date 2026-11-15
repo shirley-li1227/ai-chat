@@ -116,7 +116,7 @@ NestJS (:3001) ── sql.js ──> functions/api/data/app.db
 DeepSeek API
 ```
 
-**云端部署**（跨域，前端写死后端绝对地址）：
+**云端部署**（跨域，前端构建时注入后端绝对地址）：
 
 ```
 浏览器  https://<envId>-<appid>.tcloudbaseapp.com
@@ -191,13 +191,13 @@ npm run eval:online -- --min-accuracy=0.9         # 卡命中率下限，低于�
 
 ### 前端访问地址
 
-`frontend/src/client.ts` 顶部的 `BASE` 写死后端网关地址（跨域部署不能依赖相对路径）：
+`frontend/src/client.ts` 的 `BASE` 取自构建期环境变量：本地开发留空走 `/api`（Vite 代理到 `:3001`），跨域部署必须给绝对地址，配置在 `frontend/.env.production`：
 
-```ts
-const BASE = 'https://<envId>.service.tcloudbase.com/api'
+```bash
+VITE_API_BASE=https://<envId>.service.tcloudbase.com/api
 ```
 
-换环境时改这一行并重新构建前端。
+换环境时改这个文件并重新构建前端。
 
 ### 部署命令
 
