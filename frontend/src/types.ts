@@ -27,11 +27,18 @@ export interface Conversation {
   updatedAt: number
 }
 
-export type ProviderType = 'deepseek'
+/** 发给后端的上一轮工具轨迹：后端据此还原 assistant(tool_calls) → tool 消息链 */
+export interface OutboundStep {
+  id: string
+  name: string
+  arguments: string
+  result: string
+  ok: boolean
+}
 
-export interface ApiConfig {
-  provider: ProviderType
-  apiKey: string
-  baseUrl: string
-  model: string
+/** 发给后端的历史消息 */
+export interface OutboundMessage {
+  role: MessageRole
+  content: string
+  toolCalls?: OutboundStep[]
 }

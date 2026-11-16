@@ -1,5 +1,10 @@
 # 技术设计文档
 
+> 本文描述的是 `main` 的多用户形态（登录 + 配置落库 + 对话持久化）。
+> 当前分支 `demo-stateless` 把这三层全部去掉：后端只剩 `chat`/`agent`/`health`，不连数据库，
+> 历史由客户端上报、存在浏览器 IndexedDB。差异与取舍见 `README.md` 开头与「已知局限（演示模式）」，
+> 文中涉及 `AuthView`、`ApiConfigModal`、`context-summarizer.ts`、`ENCRYPTION_KEY` 的段落在本分支不适用。
+
 ## 系统架构
 
 ```

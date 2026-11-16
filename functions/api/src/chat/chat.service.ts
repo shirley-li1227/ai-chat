@@ -1,14 +1,12 @@
 import { Injectable, BadRequestException, Logger } from '@nestjs/common'
-import { ConfigService } from '../config/config.service'
-import { ConversationsService } from '../conversations/conversations.service'
 import { Response } from 'express'
 import { TOOL_DEFINITIONS, executeTool } from '../agent/tools'
-import type { PlainApiConfig } from '../config/config.service'
 import { runWithConcurrency } from '../agent/tool-runner'
 import { SYSTEM_PROMPT } from './prompt'
 import { resolveCompletionsUrl } from './llm-client'
-import { buildRollingSummary } from './context-summarizer'
-import { estimateTokens, planWindow } from './token-estimator'
+import type { PlainApiConfig } from './llm-config'
+import { planWindow } from './token-estimator'
+import type { HistoryMessageDto } from './chat-request.dto'
 
 // 单次请求内 Agent 工具调用的最大迭代次数，防止模型陷入无限循环消耗额度
 const MAX_TURNS = Number(process.env.AGENT_MAX_TURNS ?? 6)
@@ -23,30 +21,15 @@ const TOOL_CONCURRENCY = Math.max(
   Number(process.env.AGENT_TOOL_CONCURRENCY ?? 4),
 )
 
-/** 历史消息可用的 token 预算（不含 system 与摘要本身） */
+/** 历史消息可用的 token 预算：超出的更早轮次直接退出上下文 */
 const CONTEXT_TOKEN_BUDGET = Math.max(
   1000,
   Number(process.env.CONTEXT_TOKEN_BUDGET ?? 6000),
 )
 
-/** 窗口下限：哪怕摘要再长，也要保证至少带得走最近一问 */
-const CONTEXT_MIN_TOKENS = 800
-
-/** 关掉则退回“只裁剪不压缩”，用于对比测试或排障 */
-const CONTEXT_SUMMARY_ENABLED = process.env.CONTEXT_SUMMARY_ENABLED !== 'false'
-
 interface ToolCall {
   id: string
   function: { name: string; arguments: string }
-}
-
-/** 持久化到 DB 的工具轨迹条目 */
-interface StoredStep {
-  id: string
-  name: string
-  arguments: string
-  result: string
-  ok: boolean
 }
 
 interface OutboundMessage {
@@ -66,29 +49,13 @@ interface StreamState {
 export class ChatService {
   private readonly logger = new Logger(ChatService.name)
 
-  constructor(
-    private readonly configService: ConfigService,
-    private readonly conversationsService: ConversationsService,
-  ) {}
-
   /**
-   * 把持久化的工具轨迹展开为符合 OpenAI 协议的多轮消息：
+   * 把带工具轨迹的历史消息展开为符合 OpenAI 协议的多轮消息：
    * assistant(tool_calls) → tool(结果) → assistant(正文)，顺序不能错。
    */
-  private expandHistory(m: {
-    role: string
-    content: string
-    toolCalls: string | null
-  }): OutboundMessage[] {
+  private expandHistory(m: HistoryMessageDto): OutboundMessage[] {
     const expanded: OutboundMessage[] = []
-    let steps: StoredStep[] = []
-    if (m.toolCalls) {
-      try {
-        steps = JSON.parse(m.toolCalls) as StoredStep[]
-      } catch {
-        this.logger.warn('工具轨迹解析失败，已忽略')
-      }
-    }
+    const steps = m.toolCalls ?? []
 
     if (steps.length) {
       expanded.push({
@@ -110,120 +77,50 @@ export class ChatService {
   }
 
   /**
-   * 组装本轮要发送的历史：最近若干轮原文 + 更早内容的滚动摘要。
+   * 无状态下发历史：客户端每轮把整段对话传上来，这里只按 token 预算裁窗。
    *
-   * 摘要边界（summaryUntil）随裁剪一起推进，因此同一段旧对话不会被反复压缩，
-   * 也不会既出现在摘要里又原文重发。
+   * 与落库版本的差别是滑出窗口的旧内容直接消失，没有滚动摘要可回填——
+   * 摘要本身要有地方存才谈得上「滚动」，而这一版什么都不存。
    */
-  private async buildContext(
-    userId: string,
-    config: PlainApiConfig,
-    conversationId: string,
-    signal?: AbortSignal,
-  ): Promise<{ historyMessages: OutboundMessage[]; summary: string | null }> {
-    const ctx = await this.conversationsService.loadContext(
-      userId,
-      conversationId,
-    )
-    const messages = ctx.messages
-      .filter((m) => m.role === 'user' || m.role === 'assistant')
-      .map((m) => ({
-        role: m.role,
-        content: m.content,
-        timestamp: m.timestamp,
-        toolCalls: m.toolCalls ?? null,
-      }))
+  private buildMessages(history: HistoryMessageDto[], content: string): OutboundMessage[] {
+    // toolCalls 传 JSON 原文给裁剪器估算（含每条 tool 消息的角色开销），
+    // 同时挂一份结构化原样，裁剪后还要靠它还原协议消息
+    const all = [...history, { role: 'user' as const, content }].map((m) => ({
+      role: m.role,
+      content: m.content,
+      toolCalls: m.toolCalls?.length ? JSON.stringify(m.toolCalls) : null,
+      raw: m,
+    }))
 
-    // 摘要正文自己也要吃额度，先扣掉它实际占用的部分再算窗口
-    const priorSummary = ctx.summary
-    const budget = Math.max(
-      CONTEXT_MIN_TOKENS,
-      CONTEXT_TOKEN_BUDGET - estimateTokens(priorSummary ?? ''),
-    )
-    const { kept, dropped } = planWindow(messages, budget)
+    const { kept, dropped } = planWindow(all, CONTEXT_TOKEN_BUDGET)
 
-    const expand = (list: typeof kept) =>
-      list.flatMap((m) => this.expandHistory(m))
-
-    if (!dropped.length) {
-      return { historyMessages: expand(kept), summary: priorSummary }
+    if (dropped.length) {
+      this.logger.warn(`上下文超预算，已丢弃 ${dropped.length} 条更早消息`)
     }
 
-    if (!CONTEXT_SUMMARY_ENABLED) {
-      // 只丢不压：旧内容直接退出上下文，代价是模型失去早期记忆
-      this.logger.warn(`上下文超预算，已丢弃 ${dropped.length} 条更早消息（摘要开关已关闭）`)
-      return { historyMessages: expand(kept), summary: priorSummary }
-    }
-
-    const nextSummary = await buildRollingSummary(
-      config,
-      {
-        priorSummary,
-        // 工具轨迹不进摘要：它的结论已经体现在 assistant 正文里，重复计入只会推高成本
-        dropped: dropped.map((m) => ({ role: m.role, content: m.content })),
-      },
-      signal,
-    )
-    const boundary = dropped[dropped.length - 1].timestamp
-    await this.conversationsService.saveContext(
-      userId,
-      conversationId,
-      nextSummary,
-      boundary,
-    )
-
-    return { historyMessages: expand(kept), summary: nextSummary }
+    return kept.flatMap((m) => this.expandHistory(m.raw))
   }
 
   async streamChat(
-    userId: string,
-    conversationId: string,
+    config: PlainApiConfig | null,
+    history: HistoryMessageDto[],
     content: string,
     res: Response,
     signal?: AbortSignal,
   ): Promise<void> {
-    const config = await this.configService.get(userId)
+    // 放在写 SSE 响应头之前：此刻还是普通请求，能正常返回 400 结构化错误
     if (!config) {
-      throw new BadRequestException('尚未配置大模型 API，请先在设置中填写接口信息。')
+      throw new BadRequestException(
+        '后端未配置大模型 API Key，请在 functions/api/.env 或云函数环境变量中设置 LLM_API_KEY。',
+      )
     }
-
-    // 多实例/冷启动下该对话可能不在当前实例的库里，先确保存在，避免下面直接 404
-    await this.conversationsService.ensureExists(userId, conversationId)
-
-    // 保存用户消息
-    await this.conversationsService.addMessage(
-      userId,
-      conversationId,
-      'user',
-      content,
-    )
-
-    // 读取会话上下文：最近若干轮发原文，更早的内容走滚动摘要
-    const { historyMessages, summary } = await this.buildContext(
-      userId,
-      config,
-      conversationId,
-      signal,
-    )
 
     const messages: OutboundMessage[] = [
       { role: 'system', content: SYSTEM_PROMPT },
-      ...(summary
-        ? [
-            {
-              role: 'system',
-              content:
-                '以下是本对话更早内容的摘要，请当作已知事实使用，不要向用户复述摘要本身：\n' +
-                summary,
-            },
-          ]
-        : []),
-      ...historyMessages,
+      ...this.buildMessages(history, content),
     ]
 
     const url = resolveCompletionsUrl(config.baseUrl)
-
-    const steps: StoredStep[] = []
 
     // SSE 响应头
     res.setHeader('Content-Type', 'text/event-stream')
@@ -294,13 +191,6 @@ export class ChatService {
 
             if (!seenToolCallIds.has(call.id)) {
               seenToolCallIds.add(call.id)
-              steps.push({
-                id: call.id,
-                name: call.function.name,
-                arguments: call.function.arguments,
-                result: '',
-                ok: false,
-              })
               sendEvent({
                 tool: { id: call.id, name: call.function.name, args, status: 'calling' },
               })
@@ -325,12 +215,6 @@ export class ChatService {
               outcome.ok === true
                 ? outcome.value.output
                 : `工具执行异常：${(outcome.reason as Error)?.message ?? String(outcome.reason)}`
-
-            const recorded = steps.find((s) => s.id === call.id)
-            if (recorded) {
-              recorded.result = output
-              recorded.ok = ok
-            }
 
             sendEvent({
               tool: {
@@ -367,26 +251,11 @@ export class ChatService {
         })
       }
 
-      if (finalContent) {
-        await this.conversationsService.addMessage(
-          userId,
-          conversationId,
-          'assistant',
-          finalContent,
-          steps,
-        )
-      }
-
       res.write('data: [DONE]\n\n')
       res.end()
     } catch (error) {
       if ((error as Error).name === 'AbortError') {
-        // 用户中断：保留已生成的部分回答及工具轨迹
-        if (finalContent) {
-          await this.conversationsService
-            .addMessage(userId, conversationId, 'assistant', finalContent, steps)
-            .catch(() => undefined)
-        }
+        // 用户中断：半截回答留在客户端界面里，由它自己决定是否落盘
         res.end()
         return
       }
@@ -467,7 +336,7 @@ export class ChatService {
     }
 
     // 上游以 finish_reason: length 截断（输出达到 max_tokens 上限）：
-    // 这不是正常结束，不提示的话半截回答会被当成完整结果展示并入库
+    // 这不是正常结束，不提示的话半截回答会被当成完整结果展示
     if (state.finishReason === 'length') {
       sendEvent({ notice: '本次输出达到长度上限被截断，可回复「继续」让模型接着写' })
     }

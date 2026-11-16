@@ -17,9 +17,11 @@ async function bootstrap() {
     }),
   )
 
-  // 请求体上限，避免超大 payload 打爆内存
-  app.use(express.json({ limit: '256kb' }))
-  app.use(express.urlencoded({ extended: true, limit: '256kb' }))
+  // 请求体上限，避免超大 payload 打爆内存。
+  // 无状态模式下整段历史随每次请求上传（含工具抓取结果），256kb 只够十几轮，
+  // 再小就会出现「界面还在、发送却 413」；上限本身由 DTO 的条数与字符数兜住。
+  app.use(express.json({ limit: '1mb' }))
+  app.use(express.urlencoded({ extended: true, limit: '1mb' }))
 
   // 统一校验：剥离未声明字段（whitelist）并做类型转换
   app.useGlobalPipes(

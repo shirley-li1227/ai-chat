@@ -5,7 +5,6 @@ import remarkGfm from 'remark-gfm'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import type { Conversation, Message, ToolStep } from '../types'
-import type { ConfigResponse, AuthUser } from '../client'
 
 /** 等待首个 token 时的占位：空气泡只有内边距，看不出正在生成 */
 function GeneratingIndicator() {
@@ -92,16 +91,12 @@ function ToolStepsPanel({ steps }: { steps: ToolStep[] }) {
 }
 
 interface ChatInterfaceProps {
-  user: AuthUser
   conversations: Conversation[]
   activeConversationId: string
   hasEmptyConversation: boolean
   messages: Message[]
   isSending?: boolean
   errorMessage?: string | null
-  apiConfig: ConfigResponse | null
-  hasConfig: boolean
-  onOpenConfig: () => void
   onStop?: () => void
   onSend: (content: string) => Promise<void> | void
   /** 重新生成最后一轮回答 */
@@ -111,7 +106,6 @@ interface ChatInterfaceProps {
   onNewChat: () => void
   onSelectConversation: (conversationId: string) => void
   onDeleteConversation: (conversationId: string) => void
-  onLogout: () => void
 }
 
 function formatTime(timestamp: number): string {
@@ -123,16 +117,12 @@ function formatTime(timestamp: number): string {
 }
 
 export default function ChatInterface({
-  user,
   conversations,
   activeConversationId,
   hasEmptyConversation,
   messages,
   isSending = false,
   errorMessage = null,
-  apiConfig,
-  hasConfig,
-  onOpenConfig,
   onStop,
   onSend,
   onRegenerate,
@@ -140,7 +130,6 @@ export default function ChatInterface({
   onNewChat,
   onSelectConversation,
   onDeleteConversation,
-  onLogout,
 }: ChatInterfaceProps) {
   const [input, setInput] = useState('')
   const [copiedTimestamp, setCopiedTimestamp] = useState<number | null>(null)
@@ -154,8 +143,8 @@ export default function ChatInterface({
   const stickToBottomRef = useRef(true)
 
   const canSend = useMemo(
-    () => input.trim().length > 0 && !isSending && hasConfig,
-    [input, isSending, hasConfig],
+    () => input.trim().length > 0 && !isSending,
+    [input, isSending],
   )
 
   // 只有最后一条回答提供“重新生成”：早期回答往回重生会一并丢掉之后的上下文，
@@ -364,50 +353,7 @@ export default function ChatInterface({
         <section className="flex min-w-0 flex-1 flex-col bg-slate-50/50">
           <header className="flex items-center justify-between gap-3 border-b border-slate-200/70 bg-white/70 px-5 py-4 text-sm font-medium text-slate-700 backdrop-blur-sm">
             <span className="rounded-full bg-emerald-100 px-3 py-1 text-emerald-700">AI 聊天助手</span>
-            <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={onOpenConfig}
-              disabled={isSending}
-              className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white/80 px-3 py-1.5 text-xs text-slate-600 shadow-sm transition hover:border-emerald-300 hover:bg-emerald-50/60 hover:text-emerald-700 disabled:cursor-not-allowed disabled:opacity-60"
-              aria-label="打开大模型 API 设置"
-            >
-              <span
-                className={`h-2 w-2 rounded-full ${
-                  hasConfig ? 'bg-emerald-500' : 'bg-amber-500'
-                }`}
-              />
-              <span className="font-medium">
-                {apiConfig ? `${apiConfig.provider} · ${apiConfig.model}` : '未配置 API'}
-              </span>
-              <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
-                <circle cx="12" cy="12" r="3" />
-                <path d="M19.4 15a1.7 1.7 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.82-.33 1.7 1.7 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1-1.51 1.7 1.7 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .33-1.82 1.7 1.7 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.51-1 1.7 1.7 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.82.33H9a1.7 1.7 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.51 1.7 1.7 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.33 1.82V9a1.7 1.7 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1z" />
-              </svg>
-            </button>
-
-            <span
-              className="hidden items-center gap-1.5 rounded-full bg-slate-100/90 px-3 py-1.5 text-xs font-medium text-slate-600 sm:inline-flex"
-              title={`当前账号：${user.username}`}
-            >
-              <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
-                <circle cx="12" cy="8" r="4" />
-                <path d="M4 20a8 8 0 0 1 16 0" />
-              </svg>
-              {user.username}
-            </span>
-
-            <button
-              type="button"
-              onClick={onLogout}
-              disabled={isSending}
-              className="rounded-full border border-slate-200 bg-white/80 px-3 py-1.5 text-xs text-slate-500 shadow-sm transition hover:border-red-200 hover:bg-red-50/60 hover:text-red-600 disabled:cursor-not-allowed disabled:opacity-60"
-              title={isSending ? '生成中无法退出，请先停止回答' : '退出当前账号'}
-            >
-              退出登录
-            </button>
-            </div>
-          </header>
+            </header>
 
           {errorMessage ? (
             <div className="mx-5 mt-4 rounded-xl border border-amber-200 bg-amber-50/90 px-4 py-2.5 text-sm text-amber-700 shadow-sm">
@@ -427,20 +373,7 @@ export default function ChatInterface({
           >
             {messages.length === 0 ? (
               <div className="rounded-2xl border border-dashed border-slate-300 bg-white/80 p-8 text-center text-sm text-slate-500 shadow-sm">
-                {hasConfig ? (
-                  '输入问题开始对话'
-                ) : (
-                  <span className="inline-flex flex-col items-center gap-3">
-                    <span>尚未配置大模型 API，无法发起对话。</span>
-                    <button
-                      type="button"
-                      onClick={onOpenConfig}
-                      className="rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 px-4 py-2 text-xs font-medium text-white shadow-sm transition hover:from-emerald-600 hover:to-teal-600"
-                    >
-                      立即配置
-                    </button>
-                  </span>
-                )}
+                输入问题开始对话，需要查时间、算数或抓网页时 Agent 会自己调用工具
               </div>
             ) : null}
 
@@ -551,7 +484,7 @@ export default function ChatInterface({
                         <button
                           type="button"
                           onClick={() => handleEdit(message)}
-                          disabled={isSending || !hasConfig || rewindingTimestamp !== null}
+                          disabled={isSending || rewindingTimestamp !== null}
                           className="rounded-md px-1.5 py-0.5 text-xs text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
                         >
                           {rewindingTimestamp === message.timestamp ? '回退中…' : '编辑重发'}
@@ -561,7 +494,7 @@ export default function ChatInterface({
                         <button
                           type="button"
                           onClick={handleRegenerate}
-                          disabled={isSending || !hasConfig || rewindingTimestamp !== null}
+                          disabled={isSending || rewindingTimestamp !== null}
                           className="rounded-md px-1.5 py-0.5 text-xs text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
                         >
                           重新生成
@@ -581,10 +514,10 @@ export default function ChatInterface({
               value={input}
               onChange={(event) => setInput(event.target.value)}
               onKeyDown={handleInputKeyDown}
-              placeholder={hasConfig ? '输入你的问题...' : '请先在右上方“API 设置”中配置大模型接口'}
+              placeholder='输入你的问题...'
               rows={1}
                 className="max-h-32 min-h-10 flex-1 resize-y border-none bg-transparent px-2 py-2 text-sm text-slate-800 outline-none placeholder:text-slate-400"
-              disabled={isSending || !hasConfig}
+              disabled={isSending}
             />
             {isSending ? (
               <button
