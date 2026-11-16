@@ -1,31 +1,20 @@
 # AI 聊天助手
 
-基于 React + NestJS 的全栈 AI 聊天应用，支持流式输出、多轮对话、Markdown 渲染和代码高亮。
+前端 React 19 + TypeScript + Vite + Tailwind 4，后端 NestJS 11 + TypeORM 0.3（本地 sql.js/SQLite，云端可切 PostgreSQL），
+上游 DeepSeek（兼容 OpenAI Chat Completions，含 tools），部署在腾讯云 CloudBase（静态托管 + HTTP 云函数）。
+选型理由见 `TECH_DESIGN.md`「技术选型」。
 
 ## 功能特性
 
-- 流式输出：AI 回答逐字显示（SSE）
-- 多轮对话：自动携带历史消息上下文，可按 token 预算滑窗裁剪
-- 多会话管理：创建、切换、删除对话
 - 多用户账号：注册/登录后才进入聊天界面，API Key 与对话记录按账号隔离
-- 多轮管理：最后一轮可「重新生成」，历史提问可「编辑重发」（回退到该条再重来）
+- 流式输出：AI 回答逐字显示（SSE），工具调用步骤也在气泡内实时更新
+- 多轮上下文：自动携带历史消息，超出 token 预算时滑窗裁剪 + 旧轮次滚动摘要
+- 会话管理：创建/切换/删除；最后一轮可「重新生成」，历史提问可「编辑重发」
+- Agent 工具：内置时间查询、精确计算、网页抓取三类工具，模型自主决策调用（能力边界见 `AGENT_CAPABILITIES.md`）
 - Markdown 渲染：支持 GFM 表格、任务列表、代码高亮
-- API 配置弹窗：运行时填写大模型 API Key，无需重启
-- Agent 工具调用：内置时间查询、精确计算、网页抓取三类工具，模型自主调用并在气泡中展示执行步骤
-- 工具并发：同一轮多个 tool_calls 并发执行（可封顶并发度），结果按原顺序回填
-- 提示词版本化：集中定义 + `PROMPT_VERSION` 随 `/api/health` 暴露，附 21 条离线回归用例
+- API 配置弹窗：运行时填写大模型 API Key，无需重启；下次登录同一账号直接带出
 - 后端持久化：对话历史与配置落库（本地 sql.js/SQLite，云端可切 PostgreSQL）
 - 安全设计：API Key 仅存后端，AES-256-GCM 加密后落库，接口只返回脱敏值
-
-## 技术栈
-
-| 层级 | 技术 |
-|------|------|
-| 前端 | React 19 + TypeScript + Vite + Tailwind CSS 4 |
-| 后端 | NestJS 11 + TypeORM 0.3 + sql.js (SQLite) / PostgreSQL |
-| 大模型 | DeepSeek（兼容 OpenAI Chat Completions 协议，含 tools 调用） |
-| Markdown | react-markdown + remark-gfm + react-syntax-highlighter |
-| 部署 | 腾讯云 CloudBase：静态托管 + HTTP 云函数 + HTTP 网关 |
 
 ## 快速开始
 
@@ -58,88 +47,62 @@ npm run dev
 5. 即可开始对话；下次登录同一账号会直接带出已保存的 Key，无需重新填写
 
 > 主密钥 `ENCRYPTION_KEY`（64 位十六进制）缺失或格式非法时，保存会返回明确错误——为避免明文落库，后端不会降级成明文存储。
-
 > 引入登录之前生成的对话与大模型配置没有归属，第一个注册的账号会自动认领它们，之后各账号互相看不到。
 
 ## 项目结构
 
 ```
 ai-chat/
-├── frontend/                   # 前端（Vite + React）
-│   ├── src/                    # 前端源码
-│   │   ├── client.ts           # 后端 API 调用层
+├── frontend/                   # 前端（Vite + React），产物 frontend/dist
+│   ├── src/
+│   │   ├── App.tsx             # 根组件：登录态与会话状态管理
+│   │   ├── client.ts           # 后端 API 调用层（token / SSE）
 │   │   ├── apiConfig.ts        # 供应商预设 & 表单校验
 │   │   ├── types.ts            # TypeScript 类型定义
-│   │   ├── App.tsx             # 根组件（状态管理）
-│   │   └── components/
-│   │       ├── ChatInterface.tsx    # 聊天主界面
-│   │       └── ApiConfigModal.tsx   # API 配置弹窗
-│   ├── dist/                   # 构建产物（npm run build:frontend）
+│   │   └── components/         # AuthView / ChatInterface / ApiConfigModal
 │   ├── vite.config.ts          # /api proxy → :3001
-│   └── package.json
-├── functions/                  # 后端云函数目录
+│   └── .env.production         # VITE_API_BASE（跨域部署用）
+├── functions/
 │   └── api/                    # 接口云函数（函数名：api，type: HTTP）
 │       ├── src/
 │       │   ├── main.ts         # 启动入口（本地 :3001）
-│       │   ├── app.module.ts   # 根模块（TypeORM 配置）
+│       │   ├── app.module.ts   # 根模块（TypeORM 配置 + 全局守卫）
+│       │   ├── auth/           # 注册/登录、scrypt 散列、Bearer 会话守卫
 │       │   ├── config/         # API 配置 CRUD（加密落库 / 明文迁移）
 │       │   ├── conversations/  # 对话 & 消息实体/服务
-│       │   ├── chat/           # SSE 代理转发大模型 + Agent 多轮工具循环
-│       │   │   ├── prompt.ts           # 系统/摘要提示词 + PROMPT_VERSION
-│       │   │   ├── token-estimator.ts  # token 估算与滑窗裁剪
-│       │   │   ├── context-summarizer.ts # 旧轮次的滚动摘要
-│       │   │   └── llm-client.ts       # baseUrl 归一 + 非流式内部调用
-│       │   ├── agent/          # 工具定义与执行（时间 / 计算 / 网页抓取）+ 并发执行器
+│       │   ├── chat/           # SSE 代理 + Agent 多轮循环 + 上下文裁剪/摘要 + 提示词版本
+│       │   ├── agent/          # 工具定义与执行 + 并发执行器
 │       │   ├── security/       # AES-256-GCM 加解密、URL 内网拦截
 │       │   └── health/         # 探活接口（含 promptVersion）
-│       ├── evals/              # 提示词/工具回归集与运行脚本（不随函数包上传）
+│       ├── evals/              # 提示词/工具回归集（不随函数包上传）
 │       ├── dist/               # 构建产物，云函数实际执行的代码
 │       ├── data/               # SQLite 数据库文件（仅本地，自动创建）
 │       ├── scf_bootstrap       # HTTP 云函数启动入口（LF，监听 9000）
 │       └── package.json
 ├── cloudbaserc.json            # CloudBase 部署配置（functionRoot: ./functions）
 ├── package.json                # 仓库根编排脚本（install:all / dev / build）
-├── PRD.md                      # 产品需求
-├── TECH_DESIGN.md              # 技术设计（数据模型 / 接口 / 云端架构）
+├── PRD.md                      # 产品需求与实现对照
+├── TECH_DESIGN.md              # 技术设计（架构 / 数据模型 / 接口 / 设计取舍）
+├── AGENT_CAPABILITIES.md       # 智能体能力清单
 └── AGENTS.md                   # AI 辅助开发指令
 ```
 
-> 关于入口文件：CloudBase 官方示例常用 `functions/api/index.js`（事件函数）。本项目需要 SSE 逐字流式输出，事件函数无法流式回包，因此 `api` 声明为 `type: HTTP` 自定义运行时，入口改为 `scf_bootstrap`（导出 `PORT=9000` 后执行 `node dist/main`）。
+> 入口为什么是 `scf_bootstrap`：CloudBase 官方示例常用 `functions/api/index.js`（事件函数），但事件函数无法流式回包，
+> 所以 `api` 声明为 `type: HTTP` 自定义运行时，由 `scf_bootstrap` 导出 `PORT=9000` 后执行 `node dist/main`。
 
 ## 数据流
 
-**本地开发**（同源，走 Vite 代理）：
-
 ```
-浏览器 (localhost:5173)
-  │  /api/*  →  Vite proxy
+浏览器 ── /api/*（本地同源走 Vite 代理；云端跨域直调函数网关）
   ▼
-NestJS (:3001) ── sql.js ──> functions/api/data/app.db
+NestJS ── TypeORM（本地 functions/api/data/app.db；云端 sqljs 或 PostgreSQL）
   │  HTTPS + SSE（stream: true, tools）
   ▼
 DeepSeek API
 ```
 
-**云端部署**（跨域，前端构建时注入后端绝对地址）：
-
-```
-浏览器  https://<envId>-<appid>.tcloudbaseapp.com
-  │  fetch https://<envId>.service.tcloudbase.com/api/*
-  ▼
-CloudBase HTTP 网关 ── 路径透传 /api/*；安全域名注入 CORS 并直接应答 OPTIONS 预检
-  ▼
-HTTP 云函数 api（scf_bootstrap → NestJS :9000）
-  ├─ /api/auth/* (register|login 免登录) → scrypt 校验 → 建会话；其余接口一律带 Authorization: Bearer
-  ├─ /api/config | /api/conversations | /api/health  → TypeORM
-  └─ /api/chat (SSE) → 存 user message → 按 token 预算裁剪历史（旧轮次进摘要）
-                       → 注入 system prompt → fetch DeepSeek（stream + tools，最多 MAX_TURNS 轮）
-                       → 透传 content / tool 事件 → 存 assistant message
-```
-
-> 前端与云函数不同源，业务请求都带 `Authorization` 头，触发 CORS 预检：静态托管的跨域规则必须放行该请求头，
-> 否则登录成功后所有业务接口仍会在浏览器侧被拦下。
-
-一次对话的事件顺序：`tool(calling)`×N → `tool(done)`×N（同一轮多个工具**并发执行**，calling 先全部发出，done 按 `tool_calls` 原顺序回填）→ `content` 逐字 → `notice?`（截断提示）或 `error` → `data: [DONE]`。
+一次请求的处理顺序：存 user message → 按 token 预算裁剪历史（滑出的旧轮次进滚动摘要）→ 注入 system prompt → 多轮工具循环 → 透传 `content` / `tool` 事件 → 存 assistant message。
+云端逐跳链路（网关路径透传、安全域名、数据层切换）见 `TECH_DESIGN.md`「云端部署架构」。
 
 ## 构建生产包
 
@@ -157,14 +120,12 @@ npm run build:api        # → functions/api/dist
 提示词改一个字，工具命中率就可能变。`functions/api/evals/` 是一份可重跑的固定集，用来把“我优化了提示词”变成可比较的数字。
 
 ```bash
-npm run eval                      # 离线：先 build 再断言，不需要网络与 API Key
-$env:EVAL_API_KEY="sk-..."; npm run eval:online   # 在线：真实调模型，会消耗 token
-npm run eval:online -- --min-accuracy=0.9         # 卡命中率下限，低于阈值退出码非 0
+npm run eval                                       # 离线：22 条用例 + 结构不变量，不需要网络与 API Key
+$env:EVAL_API_KEY="sk-..."; npm run eval:online    # 在线：真实调模型测工具选择命中率，会消耗 token
+npm run eval:online -- --min-accuracy=0.9          # 卡命中率下限，低于阈值退出码非 0
 ```
 
-- **离线（默认）**：21 条用例直接调用编译产物里的 `executeTool`，断言计算结果、参数缺失/非法表达式异常、时间输出格式、SSRF 护栏（元数据端点/回环/私网/非 http 协议必须被拒）；外加几个结构不变量：提示词与工具定义对齐、`PROMPT_VERSION` 与用例钉住的版本一致、`planWindow` 保留最新后缀且永不丢弃最新一条、并发上限与保序。改完代码随手跑。
-- **在线（`--online`）**：非流式 + `tool_choice: auto`，只看模型选了哪个工具（不判正文），输出按分类统计命中率。缺 `EVAL_API_KEY` 时直接报错退出，不会静默“通过”。
-- 用例集里 `promptVersion` 与 `src/chat/prompt.ts` 不一致时评测直接失败：升提示词版本必须同时确认预期，两边不会越漂越远。
+用例覆盖范围、`PROMPT_VERSION` 与用例版本互相钉死的机制见 `TECH_DESIGN.md`「提示词版本化与回归评测」。
 
 ## 云端部署（腾讯云 CloudBase）
 
@@ -180,9 +141,7 @@ npm run eval:online -- --min-accuracy=0.9         # 卡命中率下限，低于�
 
 - `npm i -g @cloudbase/cli` 并执行 `tcb login`
 - 开通 CloudBase 环境；默认域名有限流，仅适合验证；自定义域名需 ICP 备案（约 7–20 天）
-- 数据层二选一：
-  - **演示**：`DB_TYPE=sqljs` + `DB_LOCATION=/tmp/app.db`，零外部依赖，但多实例不共享、冷启动清空（见「已知局限」）
-  - **正式**：`DB_TYPE=postgres`（环境内置 PostgreSQL 或 TencentDB for PostgreSQL）；云函数访问数据库需开启 VPC，与数据库同 VPC/子网
+- 数据层二选一：**演示**用 `DB_TYPE=sqljs` + `DB_LOCATION=/tmp/app.db`（零外部依赖，代价见「已知局限」）；**正式**用 `DB_TYPE=postgres`，云函数需开启 VPC 并与数据库同 VPC/子网
 
 ### 部署配置
 
@@ -193,19 +152,13 @@ npm run eval:online -- --min-accuracy=0.9         # 卡命中率下限，低于�
    ```
    `{{env.XXX}}` 由 CLI 在部署时从根目录 `.env.local` 插值进函数环境变量。
 2. `cloudbaserc.json`（v2.1 schema）关键点：`envId`、`functionRoot: "./functions"`；函数不写 `dir`，由 `functionRoot/name` 推导为 `functions/api`（v2.1 中 `dir` 是相对项目根目录而非 functionRoot）。切 PostgreSQL 时只需补齐 `DB_HOST`、`DB_USERNAME` 为内网连接信息
-3. 函数声明为 `type: HTTP` + `runtime: Nodejs20.19` + `gatewayPath: "/api"` + `public: true`；入口是 `scf_bootstrap`（导出 `PORT=9000` 后 `exec node dist/main`），HTTP 函数必须监听 9000
+3. 函数声明为 `type: HTTP` + `runtime: Nodejs20.19` + `gatewayPath: "/api"` + `public: true`；HTTP 函数必须监听 9000
 4. 云函数默认 5 秒超时会砍断 SSE，配置中已设为 300 秒；一次 SSE 连接占用一个函数实例
 5. **`CORS_ORIGINS` 保持为空**：跨域响应头统一由网关「安全域名」注入。在这里填前端域名会导致 NestJS 与网关各加一份 `Access-Control-Allow-Origin`，浏览器因“多个值只允许一个”直接拦截
-
-### 前端访问地址
-
-`frontend/src/client.ts` 的 `BASE` 取自构建期环境变量：本地开发留空走 `/api`（Vite 代理到 `:3001`），跨域部署必须给绝对地址，配置在 `frontend/.env.production`：
-
-```bash
-VITE_API_BASE=https://<envId>.service.tcloudbase.com/api
-```
-
-换环境时改这个文件并重新构建前端。
+6. `frontend/.env.production` 写后端绝对地址（本地开发留空走 `/api` 代理），换环境时改这里并重新构建前端：
+   ```bash
+   VITE_API_BASE=https://<envId>.service.tcloudbase.com/api
+   ```
 
 ### 部署命令
 
@@ -218,7 +171,7 @@ tcb hosting deploy frontend/dist / -e <envId>    # 前端产物上传到托管�
 ### 控制台关键配置
 
 - **HTTP 网关 · 路径透传**：后端控制器自带 `/api` 前缀，网关不能剥掉。`/api` 路由关联的**每条域名**（通配 `*` 与环境专属域名）都要设 `enablePathTransmission: true`，否则所有请求 404。CLI：`tcb routes list`、`tcb routes edit`
-- **安全域名（网关级 CORS）**：把前端托管域名 `https://<envId>-<appid>.tcloudbaseapp.com` 加入白名单（`tcb cors list`）。网关会自动注入 CORS 头并直接应答 `OPTIONS` 预检（204），不拉起函数实例
+- **安全域名（网关级 CORS）**：把前端托管域名 `https://<envId>-<appid>.tcloudbaseapp.com` 加入白名单（`tcb cors list`）。网关会自动注入 CORS 头并直接应答 `OPTIONS` 预检（204），不拉起函数实例。业务请求都带 `Authorization`，白名单必须放行该请求头，否则登录成功后的接口仍会在浏览器侧被拦下
 - **静态托管**：错误页面设为 `index.html`（SPA 回退，深链接刷新不 404）；带 hash 的 CSS/JS 约 7 天缓存、`index.html` 约 1 小时，发布后本地要 Ctrl+F5
 - **不要与云应用 WebApps 混淆**：`tcb hosting deploy` 只写托管桶，**不会产生“应用/部署记录”**（用 `tcb hosting list /` 查看文件）；控制台里带“部署版本/部署记录”、域名是 `*.webapps.tcloudbase.com` 的是另一个产品，本项目不用
 
@@ -250,7 +203,6 @@ curl -X POST https://<envId>.service.tcloudbase.com/api/conversations/<id>/trunc
 - 后端使用 `nest start --watch` 热重载，修改 functions/api/src 下文件自动重启
 - 前端 Vite HMR 即时更新；修改 `frontend/vite.config.ts` 需重启前端
 - 本地 SQLite 数据库文件位于 `functions/api/data/app.db`，首次启动自动创建表结构（synchronize: true）
-- API Key 以密文落库（前缀 `gcm1:`），接口只返回脱敏值 `apiKeyMasked`，明文仅在调用上游时内存中存在
 - 改了后端 `src` 必须 `npm run build:api` 再 `tcb fn deploy`：`ignore` 排除了 `src` 与 `evals`，云端跑的是包内 `dist/`（仅在明确要求时才发布）
 - 改提示词要同时升 `PROMPT_VERSION` 并跑 `npm run eval`，否则版本不一致会直接判失败；仅注释/空白调整不必升版本
-- 上下文窗口、工具并发、摘要开关分别由 `CONTEXT_TOKEN_BUDGET`、`AGENT_TOOL_CONCURRENCY`、`CONTEXT_SUMMARY_ENABLED` 控制，见 `functions/api/.env.example` 与 `cloudbaserc.json`
+- Agent 相关的可调参数（上下文预算、工具并发、摘要开关、抓取超时）见 `AGENT_CAPABILITIES.md`「可调参数」，完整清单在 `functions/api/.env.example`

@@ -3,36 +3,22 @@
 ## 系统架构
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        浏览器                                 │
-│   React 19 + TypeScript + Tailwind CSS 4                    │
-│   ┌─────────────────┐  ┌──────────────────┐                 │
-│   │ ChatInterface   │  │ ApiConfigModal   │                 │
-│   └────────┬────────┘  └────────┬─────────┘                 │
-│            └──────────┬──────────┘                           │
-│                 src/client.ts (API 层)                       │
-└────────────────────────┬─────────────────────────────────────┘
-                    │ HTTP / SSE（本地同源 /api/*；云端跨域，见「云端部署架构」）
-┌────────────────────────▼─────────────────────────────────────┐
-│              Vite Dev Server (:5173)                          │
-│         proxy: /api → http://localhost:3001                   │
-└────────────────────────┬─────────────────────────────────────┘
-                         │
-┌────────────────────────▼─────────────────────────────────────┐
-│              NestJS Backend (:3001)                           │
-│  ┌────────────┐  ┌──────────────────┐  ┌──────────────┐     │
-│  │ConfigModule│  │ConversationsModule│  │  ChatModule  │     │
-│  │ (CRUD)     │  │ (CRUD + 级联)     │  │ (SSE 代理)   │     │
-│  └─────┬──────┘  └────────┬─────────┘  └──────┬───────┘     │
-│        └───────────────────┼───────────────────┘             │
-│                    TypeORM + sql.js                           │
-│            (functions/api/data/app.db)                        │
-└────────────────────────────┬─────────────────────────────────┘
-                             │ HTTPS + SSE
-┌────────────────────────────▼─────────────────────────────────┐
-│                    DeepSeek API                               │
-│         https://api.deepseek.com/chat/completions             │
-└──────────────────────────────────────────────────────────────┘
+浏览器  React 19 + TS + Tailwind 4
+  ├─ ChatInterface / AuthView / ApiConfigModal
+  └─ src/client.ts（统一 API 层：token、SSE 解析）
+       │ HTTP / SSE（本地同源 /api/*；云端跨域，见「云端部署架构」）
+       ▼
+Vite Dev Server :5173 ── proxy /api → :3001（仅本地开发）
+       ▼
+NestJS Backend :3001
+  ├─ AuthModule          注册/登录、Bearer 会话守卫
+  ├─ ConfigModule        API 配置 CRUD（加密落库）
+  ├─ ConversationsModule 对话 & 消息（CASCADE）
+  ├─ ChatModule          SSE 代理 + Agent 多轮循环 + 上下文裁剪/摘要
+  └─ TypeORM + sql.js → functions/api/data/app.db
+       │ HTTPS + SSE（stream: true, tools）
+       ▼
+DeepSeek API  https://api.deepseek.com/chat/completions
 ```
 
 ## 云端部署架构
@@ -60,9 +46,9 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 | CORS 只能一层 | Nest `enableCors` 与网关安全域名会各加一份 ACAO；函数侧 `CORS_ORIGINS` 留空，只靠网关 |
 | 实例粘性 + `/tmp` | sqljs 下 config / 对话不跨实例共享；chat 先用 `ensureExists()` 补建对话规避 404，根治要切 postgres |
 | 限流 | `ThrottlerGuard` 计数在进程内存，实际放行量 ≈ limit × 实例数，需网关限频兜底 |
-| 部署产物 | `ignore` 排除 `src` 与 `evals`，云端执行包内 `dist/`，改源码必须重新 build + deploy |
 | 摘要与多实例 | `contextSummary`/`summaryUntil` 跟着库走；sqljs 下冷启动会连同摘要一起丢失（切 postgres 根治），但不会造成“摘要覆盖不存在的消息”这类错乱 |
-| 路径区分产品 | `tcb hosting` 写托管桶根目录、无“部署记录”；`*.webapps.tcloudbase.com` 是另一个产品云应用 WebApps，本项目不用 |
+
+> 部署期操作约束（VPC 打通、控制台路径透传与安全域名、上线验收、sqljs 局限的根治步骤）统一写在 README「云端部署（腾讯云 CloudBase）」，此处不重复。
 
 ## 技术选型
 
@@ -101,7 +87,7 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 | passwordHash | varchar(256) | `scrypt$N$r$p$salt$hash`，参数随散列一起存，日后调参不影响老口令校验 |
 | createdAt / updatedAt | datetime | 自动 |
 
-口令用 Node 内置 `crypto.scrypt` 加盐散列（N=16384、r=8、p=1、16 字节随机盐、32 字节输出，约 16MB 内存，落在 Node 默认 maxmem 内）。校验前对输入做 NFKC 归一，避免同形字符导致“看着一样却登不进去”。
+口令用 Node 内置 `crypto.scrypt` 加盐散列（N=16384、r=8、p=1、16 字节随机盐、32 字节输出，约 16MB 内存，落在 Node 默认 maxmem 内）。校验前对输入做 NFKC 归一，避免同形字符导致“看着一样却登不进去”。明文口令既不落库也不写日志。
 
 ### Session
 
@@ -253,18 +239,18 @@ SYSTEM_PROMPT / SUMMARY_PROMPT 从 service 里抽到 `chat/prompt.ts`，并导�
 - 版本号随 `/api/health` 暴露，`evals/cases.json` 钉住同一个版本；两边不一致时评测直接失败，强制“改提示词 → 确认预期 → 升版本”这个动作不被遗漏
 - 正文含三块：工具使用准则、工具判定示例（few-shot，只示范该不该调、调哪个、参数怎么给）、输出格式规范
 
-`npm run eval`（离线，21 条用例 + 结构不变量，无需网络与 Key）覆盖：工具计算与异常、SSRF 护栏（元数据端点/回环/私网/非 http 协议）、`planWindow` 裁剪语义、并发上限与保序、`baseUrl` 归一化。`npm run eval:online` 用 `EVAL_API_KEY` 做非流式请求，断言 `expectTool` 命中率，可用 `--min-accuracy` 卡下限。在线模式缺 Key 时报错退出而不是静默通过。
+`npm run eval`（离线，22 条用例 + 结构不变量，无需网络与 Key）覆盖：工具计算与异常、SSRF 护栏（元数据端点/回环/私网/非 http 协议）、`planWindow` 裁剪语义、并发上限与保序、`baseUrl` 归一化。`npm run eval:online` 用 `EVAL_API_KEY` 做非流式请求，断言 `expectTool` 命中率，可用 `--min-accuracy` 卡下限；在线模式缺 Key 时报错退出而不是静默通过。运行命令见 README「回归评测」。
 
 > 评测集已经发现过两个真实缺陷：calculator 的标识符正则不含数字，`log10(1000)` 被切成 `log`+`10` 报“需要括号参数”；另一个是用例自写错（期望“星期X”，工具实际输出“周日”）—— 后者提醒断言要对着实现写，而不是对着描述文字写。
 
-### 安全设计
+## 安全设计
 
-- API Key 经 AES-256-GCM 加密后落库，主密钥 `ENCRYPTION_KEY` 从环境变量注入；`GET /api/config` 只返回 `apiKeyMasked`
-- 口令用 `crypto.scrypt` 加盐散列存储，明文不落库、不写日志；登录接口无论用户是否存在都执行一次 scrypt（不存在时比对固定 `DUMMY_HASH`），避免用响应耗时枚举用户名
+- API Key 经 AES-256-GCM 加密后落库（密文格式见「ApiConfig」），主密钥 `ENCRYPTION_KEY` 从环境变量注入；`GET /api/config` 只返回 `apiKeyMasked`，明文仅在调用上游时存在于内存
+- 主密钥缺失或格式非法时拒绝保存，错误信息里直接给出生成命令；不会退化成明文落库。读到历史明文配置会在密钥可用时自动加密回写
+- 口令散列参数见「User」；登录接口无论用户是否存在都执行一次 scrypt（不存在时比对固定 `DUMMY_HASH`），避免用响应耗时枚举用户名
 - 业务接口全部要求 Bearer token；所有会话读写以 `userId` 为过滤条件，越权访问一律 404，不区分“不存在”和“不是你的”
 - token 存 localStorage 而不是 Cookie：后端是独立的云函数域名，跨站 Cookie 需要 SameSite=None 且依赖网关配合；代价是 XSS 可读，依赖 React 转义兜底
-- 主密钥缺失或格式非法时拒绝保存，错误信息里直接给出生成命令；不会退化成明文落库。读到历史明文配置会在密钥可用时自动加密回写
-- 前端不直连 DeepSeek，密钥不进入浏览器
+- 前端不直连大模型，密钥不进入浏览器
 - `fetch_url` 工具走 URL 校验（`security/url-guard.ts`）+ 超时与体积上限，防 SSRF 和超大响应；协议限制、域名黑名单、**字面量 IP 与 DNS 全量解析结果都不能落入内网**，且每跳重定向重新校验
 - 本地开发由 Vite proxy 仅转发 `/api/*`；云端跨域只靠网关安全域名放行，函数侧 `CORS_ORIGINS` 留空
 
@@ -275,37 +261,19 @@ SYSTEM_PROMPT / SUMMARY_PROMPT 从 service 里抽到 `chat/prompt.ts`，并导�
 | `frontend/src/client.ts` | 封装所有后端 HTTP/SSE 调用（含 `truncateConversation`）；统一管理 token（localStorage）与 `Authorization` 头，任一接口 401 时广播 `ai-chat:unauthorized` 让 App 收回登录态 |
 | `frontend/src/apiConfig.ts` | PROVIDER_PRESETS（给 Modal UI 渲染用）、表单校验工具 |
 | `frontend/src/types.ts` | Message / Conversation / ApiConfig / ProviderType 类型 |
-| `frontend/src/App.tsx` | 状态管理：登录态、对话列表、当前会话、配置状态、发送/停止；首屏用 token 换登录态，未登录只渲染 `AuthView`；登录后拉该账号配置，没配 Key 自动弹设置窗；`rewindTo` 统一承载“重新生成”与“编辑重发”（先改后端再同步本地）；`pagehide`/卸载时 abort 在途 SSE |
-| `frontend/src/components/AuthView.tsx` | 登录/注册页：模式切换、前置长度校验、错误提示（连不上后端翻译成启动命令提示）、提交中禁用按钮 |
+| `frontend/src/App.tsx` | 状态管理：登录态、会话列表、当前会话、配置状态；首屏用 token 换登录态，未登录只渲染 `AuthView`；登录后没配 Key 自动弹设置窗；`rewindTo` 统一承载“重新生成”与“编辑重发”（先改后端再同步本地）；`pagehide`/卸载时 abort 在途 SSE |
+| `frontend/src/components/AuthView.tsx` | 登录/注册页：模式切换、前置长度校验、错误提示、提交中禁用按钮 |
 | `frontend/src/components/ChatInterface.tsx` | 纯 UI：侧栏 + 气泡 + 输入框 + Markdown 渲染 + 工具步骤面板；“重新生成”仅给最后一条回答，“编辑重发”仅给历史用户消息；顶栏展示当前账号与「退出登录」（生成中禁用） |
 | `frontend/src/components/ApiConfigModal.tsx` | 配置弹窗 UI：供应商选择 + Key/Model/BaseURL 表单 |
 
-## 启动命令
-
-```bash
-# 终端 1
-npm run dev:api                    # NestJS :3001（functions/api）
-
-# 终端 2
-npm run dev                        # Vite :5173（自动 proxy /api → :3001）
-
-# 改完提示词/工具后跑回归（先 build 再断言，不需要 Key）
-npm run eval
-
-# 只在改动提示词后跑：真实调模型测工具选择命中率
-$env:EVAL_API_KEY="sk-..."; npm run eval:online
-```
-
 ## 扩展方向
 
-已落地（不再是待办）：工具并发执行、上下文窗口裁剪 + 滚动摘要、重新生成 / 编辑重发、提示词版本化 + 回归评测。
+已落地（不再是待办）：多用户账号与数据隔离、CloudBase 静态托管 + HTTP 云函数部署、工具并发执行、上下文窗口裁剪 + 滚动摘要、重新生成 / 编辑重发、提示词版本化 + 回归评测。
 
+- 数据层根治：把 `DB_TYPE` 切到 `postgres`，消除多实例/冷启动导致的配置与历史丢失（当前所有“演示模式局限”的根因）
 - 对话分支：`truncateFrom` 已经是它的地基，缺的是一份“父消息/分支树”数据模型与前端切换 UI
 - 历史消息分页/虚拟滚动：现在一次 `GET :id` 拉全量；长对话需后端加分页 + 前端定高虚拟化
-- 多路并发 SSE：单路流内能做的是工具并发；“一个请求开多路回答”需先把数据层切到 postgres（`/tmp` 不支持多实例共享）并调高 `InstanceConcurrency`
+- 多路并发 SSE：单路流内能做的是工具并发；“一个请求开多路回答”需先把数据层切到 postgres 并调高 `InstanceConcurrency`
 - 后台长任务：与 HTTP 请求生命周期不匹配（函数硬顶 300 秒、`pagehide` 语义恰好相反），需单独的任务队列
 - 多供应商支持：在 `PROVIDER_PRESETS` 中新增条目，后端 ChatService 按 provider 切换请求逻辑
 - 文生图：新增 CogView / DALL-E 接口，后端添加 `/api/images/generations` 代理
-- 用户认证：加入 JWT + 多用户隔离
-- 生产部署：已落地 CloudBase 静态托管 + HTTP 云函数（跨域直调，见上文「云端部署架构」与 README「云端部署」）
-- 数据层根治：把 `DB_TYPE` 切到 `postgres`，消除多实例/冷启动导致的配置与历史丢失
