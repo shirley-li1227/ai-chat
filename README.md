@@ -9,7 +9,9 @@
 - 多用户账号：注册/登录后才进入聊天界面，API Key 与对话记录按账号隔离
 - 免登录演示模式：`AUTH_ENABLED` 未设为 `true` 时跳过登录页，直接以既有账号身份使用（默认即此状态，详见「首次配置」）
 - 流式输出：AI 回答逐字显示（SSE），工具调用步骤也在气泡内实时更新
+- 断线自动续传：连接中途断掉时，已生成的半截回答照样落库；浏览器带它重连，服务端只补后半段，用户看到的仍是一条完整回答（详见「本地演示：断线自动续传」）
 - 多轮上下文：自动携带历史消息，超出 token 预算时滑窗裁剪 + 旧轮次滚动摘要
+- 场景化模型选择：同一供应商内按问题复杂度在几档模型之间自动换档，顶栏与每条回答都标出「刚才是哪个模型答的、为什么选它」；断线续传沿用中断那一轮的模型，不会前后半段换人（详见「场景化模型选择」）
 - 会话管理：创建/切换/删除；最后一轮可「重新生成」，历史提问可「编辑重发」
 - Agent 工具：内置时间查询、精确计算、网页抓取三类工具，模型自主决策调用（能力边界见 `AGENT_CAPABILITIES.md`）
 - 后台长任务：任务表、队列语义（租约/退避/重试/幂等）与 REST 接口已就绪，前端有「后台任务」面板；**执行器进程尚未部署**，所以默认关闭，此状态下提交的任务只会停在排队（详见「已知局限」）
@@ -58,6 +60,33 @@ npm run dev
 > 引入登录之前生成的对话与大模型配置没有归属，第一个注册的账号（或免登录时自动创建的 `demo`）会自动认领它们，之后各账号互相看不到。
 > 免登录下所有访问者共用同一个身份，公开域名前先读「已知局限（免登录演示模式）」。
 
+### 场景化模型选择
+
+同一供应商里的几档模型，**服务端按本轮问题的复杂度挑一档**：不新增供应商、不换协议、不改前端配置。
+
+- 候选档位**从低到高**写在 `MODEL_ROUTING_CANDIDATES`（逗号分隔，如 `deepseek-flash,deepseek-v4-pro`）。留空等于不开启，回答恒用配置里的主力模型，行为与开启前完全一致；`MODEL_ROUTING_ENABLED=false` 是同一效果的显式开关，用于对比测试或排障。
+- 模型名不写死在代码里：供应商的 id 会换，用户也未必开通了高那一档。配什么用什么，白名单外的名字永远不会被选中。
+- 判定用的是确定可得的信号——问题长度，加上「要求深入 / 分析设计类 / 含代码 / 格式要求」四类关键词，加权成 0~1 的复杂度分，再按候选数线性分档。刻意不让模型自己「换个模型再答一遍」：那要多一跳工具调用、双份 token、还会白吃掉 `AGENT_MAX_TURNS` 的轮数预算。
+- 界面解释得清：每轮 SSE 开头下发一条 `model` 事件（模型 id、复杂度分、中文理由），顶栏显示最近一条回答实际用的模型，气泡下方标出该条的模型名，悬停看理由。assistant 消息也落库 `model`，刷新后仍知道是谁答的。
+- **续传不换模型**：中断那轮用的档位随半截回答一起落库，`/api/chat/resume` 优先沿用它（前提是该模型还在候选白名单里）。否则前后半段风格断裂甚至自相矛盾，而浏览器手上只有文本，看不出问题出在模型换了。
+
+> 这层只换「用哪个文本模型答」，不会因此获得图像理解能力——那需要供应商本身支持 `image_url`，属于另一件事。
+
+### 本地演示：断线自动续传
+
+这条链路只在本地演：它需要一个「故意把流掐断」的假上游，线上没法可控地制造断流。三个服务都跑在 `127.0.0.1`，不联网、不用真实密钥。
+同一套假上游顺带也能演模型路由——它会把每次请求带的 `model` 打进日志，换档与「续传不换模型」都看得见。
+
+1. 起一个假上游（几十行的 Node 脚本即可）：`POST /v1/chat/completions` 第一次请求吐两段就 `res.destroy()`，之后正常吐完并补 `finish_reason: stop` + `data: [DONE]`。
+2. 后端指向**临时库**启动，别用 `functions/api/data/app.db`：
+   `NODE_ENV=development DB_TYPE=sqljs DB_LOCATION=<临时目录>/demo.db ENCRYPTION_KEY=<64 位十六进制> AUTH_ENABLED=false MODEL_ROUTING_CANDIDATES=test-flash,test-pro PORT=3001 node dist/main.js`
+   候选档位随手写两个假名字即可，假上游只认「请求里带的 model 是哪个」。
+3. 把配置写进那个临时库。`baseUrl` 有「必须 https」的产品级校验，本地假上游是 http，所以**不要为此放宽校验**，直接调 `ConfigService.save(userId, {...})` 播种（校验只在 DTO 层，运行时不再复查）。用户 id 从 `GET /api/auth/mode` 拿。
+4. 起前端 `npm run dev`，浏览器先发一句短问候，再发一句「请仔细分析这段代码的性能问题，并给出优化方案（中途掐断一下）」。预期：前者气泡标 `test-flash`，后者标 `test-pro`；后者先逐字出现前半段，接着提示「连接中断，正在第 1/3 次自动续传…」，最后合并成一条完整回答并显示「网络曾中断，回答已从断点续写完成。」，模型标记不变。
+5. 核对落库：`GET /api/conversations/:id` 应该只有一条 user + 一条 assistant，assistant 内容是完整回答且 `model` 仍是 `test-pro`；假上游日志应该恰好两次请求，两次的 `model` 相同。
+
+> 关键实现约束：断线检测挂在 **`res` 的 `close`** 上并用 `writableEnded` 区分「正常写完」与「半路被关」。挂在 `req` 上没用——Node 在请求体读完时就发出 `req` 的 `close`，那时回答还没开始生成，控制器挂监听时事件早已过去，等于永远检测不到断线，服务端会闷头把整段跑完再落库。
+
 ## 项目结构
 
 ```
@@ -79,7 +108,7 @@ ai-chat/
 │       │   ├── auth/           # 注册/登录、scrypt 散列、Bearer 会话守卫、AUTH_ENABLED 免登录模式
 │       │   ├── config/         # API 配置 CRUD（加密落库 / 明文迁移）
 │       │   ├── conversations/  # 对话 & 消息实体/服务
-│       │   ├── chat/           # SSE 代理 + Agent 多轮循环 + 上下文裁剪/摘要 + 提示词版本
+│       │   ├── chat/           # SSE 代理 + Agent 多轮循环 + 上下文裁剪/摘要 + 模型路由 + 提示词版本
 │       │   ├── agent/          # 工具注册表（schema + 校验 + 执行）+ 并发执行器
 │       │   ├── tasks/          # 后台任务：实体、队列策略、类型注册表、REST 接口（不含执行器）
 │       │   ├── security/       # AES-256-GCM 加解密、URL 内网拦截
@@ -92,9 +121,10 @@ ai-chat/
 ├── cloudbaserc.json            # CloudBase 部署配置（functionRoot: ./functions）
 ├── package.json                # 仓库根编排脚本（install:all / dev / build）
 ├── PRD.md                      # 产品需求与实现对照
+├── DEMO_CHECKLIST.md           # 线上演示清单：能演什么、怎么演、哪些演不了
 ├── TECH_DESIGN.md              # 技术设计（架构 / 数据模型 / 接口 / 设计取舍）
 ├── AGENT_CAPABILITIES.md       # 智能体能力清单
-└── AGENTS.md                   # AI 辅助开发指令
+└── AGENTS.md                   # 开发指令：约束、命令、验证规矩（AI 助手与人都读这份）
 ```
 
 > 入口为什么是 `scf_bootstrap`：CloudBase 官方示例常用 `functions/api/index.js`（事件函数），但事件函数无法流式回包，
@@ -112,6 +142,7 @@ DeepSeek API
 ```
 
 一次请求的处理顺序：存 user message → 按 token 预算裁剪历史（滑出的旧轮次进滚动摘要）→ 注入 system prompt → 多轮工具循环 → 透传 `content` / `tool` 事件 → 存 assistant message。
+断线时走 `/api/chat/resume`：浏览器把已渲染的前半段原样带回，服务端撤掉中断那轮的半截记录、以它为 assistant 前缀重新请求，只推增量，最后合成一条完整回答落库。
 云端逐跳链路（网关路径透传、安全域名、数据层切换）见 `TECH_DESIGN.md`「云端部署架构」。
 
 ## 构建生产包
@@ -130,7 +161,7 @@ npm run build:api        # → functions/api/dist
 提示词改一个字，工具命中率就可能变。`functions/api/evals/` 是一份可重跑的固定集，用来把“我优化了提示词”变成可比较的数字。
 
 ```bash
-npm run eval                                       # 离线：46 项断言（19 条工具用例 + 提示词/上下文/并发/队列/鉴权模式不变量），不需要网络与 API Key
+npm run eval                                       # 离线：57 项断言（19 条工具用例 + 提示词/上下文/并发/队列/鉴权模式/断点续传/模型路由不变量），不需要网络与 API Key
 $env:EVAL_API_KEY="sk-..."; npm run eval:online    # 在线：真实调模型测工具选择命中率，会消耗 token
 npm run eval:online -- --min-accuracy=0.9          # 卡命中率下限，低于阈值退出码非 0
 ```
@@ -152,6 +183,7 @@ npm run eval:online -- --min-accuracy=0.9          # 卡命中率下限，低于
 - `npm i -g @cloudbase/cli` 并执行 `tcb login`
 - 开通 CloudBase 环境；默认域名有限流，仅适合验证；自定义域名需 ICP 备案（约 7–20 天）
 - 数据层二选一：**演示**用 `DB_TYPE=sqljs` + `DB_LOCATION=/tmp/app.db`（零外部依赖，代价见「已知局限」）；**正式**用 `DB_TYPE=postgres`，云函数需开启 VPC 并与数据库同 VPC/子网
+- 切 Postgres 后 `synchronize` 默认关闭，**改实体必须手动补列**（本次新增的是 `messages.model`，写法见 `TECH_DESIGN.md`「数据模型」），否则新字段在第一次写库时才报错
 
 ### 部署配置
 
@@ -171,6 +203,7 @@ npm run eval:online -- --min-accuracy=0.9          # 卡命中率下限，低于
    ```
 7. **`BACKGROUND_TASKS_ENABLED` 保持 `false`**，直到后台执行器（独立常驻进程）真的部署起来。设为 `true` 会把 `run_in_background` 广播给模型，模型随即开始提交没人执行的任务——队列只会堆积，界面永远显示「排队中」。全部可调变量的默认值与含义见 `functions/api/.env.example`
 8. **`AUTH_ENABLED` 在 `cloudbaserc.json` 里显式写为 `false`**，发布上去直接就是免登录演示站：访客不用注册，进页面即用。这是有意选择而不是漏配，但它把域名变成了公共资源——任何人都能调 `/api/chat` 花掉你的大模型配额、`/api/config` 读写那份配置（Key 本身只回掩码，不回明文），全站数据共用同一账号，只剩 `THROTTLE_TTL/THROTTLE_LIMIT` 这一层 IP 限流。要按人隔离就把它改成 `true` 重新部署，登录页和账号隔离会原样回来。
+9. **`MODEL_ROUTING_CANDIDATES` 默认留空**，也就是线上恒用配置里的主力模型。要按场景换档就填该账号**确实开通了的**模型 id（从低到高，如 `deepseek-flash,deepseek-v4-pro`）——填了没开通的名字会在请求上游时拿到 4xx，界面直接报后端翻译过的错误。开关与候选同时暴露在 `GET /api/health`（`modelRouting` / `modelCandidates`），线上「这句为什么换了个模型答」不用重新发布就能查。
 
 ### 部署命令
 
@@ -211,6 +244,7 @@ curl https://<envId>.service.tcloudbase.com/api/tasks -H "Authorization: Bearer 
 - A 实例建了对话、B 实例没有，chat 曾返回 404「对话不存在」。后端已加 `ConversationsService.ensureExists()`：配置校验通过后若对话缺失就用前端传的 id 补建，消除 404。
 - 但 **config 与历史消息仍不共享**，可能随机出现“刚配好又提示未配置”、“历史时多时少”。
 - 限流计数存在进程内存，实际放行量约为 `THROTTLE_LIMIT × 实例数`，需靠网关限频兜底。
+- 断线续传的进度虽然由浏览器携带，但「撤掉中断那轮半截记录」这一步仍发生在当前实例的库里。若首发落在 A 实例、续传落到 B 实例，B 库里没有那条半截（于是续传结果在 B 看来只有一条完整回答），而回到 A 时可能同时看到那条半截。切 PostgreSQL 后各实例共享一份库，这个窗口就不存在了。
 
 要稳定对外，把 `DB_TYPE` 改为 `postgres` 并填齐 `DB_HOST/DB_PORT/DB_USERNAME/DB_PASSWORD/DB_DATABASE`（VPC 内网地址）后重新部署，所有实例共享一份库即可根治。
 

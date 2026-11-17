@@ -124,8 +124,12 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 | role | varchar | 'user' 或 'assistant' |
 | content | text | 消息正文 |
 | toolCalls | text, nullable | Agent 工具轨迹 JSON（id/name/arguments/result/ok），仅 assistant 消息有值；既供前端展示步骤，也供多轮还原 tool_calls 上下文 |
+| model | varchar(128), nullable | 本轮**实际作答**的模型 id，仅 assistant 消息有值。开了模型路由后配置里的名字不再等于答案来源，界面与续传都读这一列；改动之前的历史数据为 `null`，续传时回退路由器 |
 | timestamp | bigint | 毫秒时间戳（前端排序用） |
 | conversation | FK → Conversation | 所属对话（CASCADE 删除） |
+
+> 生产 Postgres 关着 `synchronize`，`migrationsRun` 又没有可跑的迁移目录，所以**改实体必须手动补列**，否则新字段会在第一次写库时炸：
+> `ALTER TABLE messages ADD COLUMN IF NOT EXISTS model varchar(128)`（可空；旧行留 `NULL`，续传遇到 `NULL` 回退路由器，不报错）。
 
 ### Task（后台任务）
 
@@ -235,26 +239,75 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 | 工具开始 | `{"tool":{"id","name","args","status":"calling"}}` | 模型决定调用工具；**同一轮的多个调用会先全部发出再并发执行**，展示顺序与执行完成顺序无关 |
 | 工具结束 | `{"tool":{"id","name","result","ok","status":"done"}}` | 结果按 `tool_calls` 原顺序回填，前端靠 `id` 对位更新 |
 | 提示 | `{"notice":"…被截断…"}` | 非致命提示（如输出撞长度上限） |
-| 错误 | `{"error":"具体错误信息"}` | 上游 4xx/5xx、轮数耗尽、网络异常 |
+| 模型 | `{"model":{"id":"deepseek-flash","reason":"…","score":0.56}}` | 每轮开头发一次，说明**这条回答实际由哪个模型作答、为什么选它**；路由关闭时 `id` 就是配置里的主力模型、`score` 恒为 0 |
+| 错误 | `{"error":"具体错误信息","retryable":true}` | 上游 4xx/5xx、轮数耗尽、网络异常；`retryable` 决定前端能不能拿已生成内容续传 |
 | 结束 | `data: [DONE]` | 流终止信号 |
 
 业务异常仍走 HTTP 状态码（在 SSE 头写出之前抛出）：未配置 Key → `400 尚未配置大模型 API…`。
+
+`POST /api/chat/resume`
+
+请求体：
+```json
+{ "conversationId": "uuid", "content": "本轮原始提问", "partial": "浏览器已渲染的前半段回答" }
+```
+
+响应与 `POST /api/chat` 完全同构，但**只推后半段增量**——前半段浏览器已经有了，重发一遍等于让用户看见两遍。
+
+`partial` 的校验与续传上限同源（`continuation.ts` 的 `MAX_RESUME_PARTIAL_CHARS = 30000`）：空或纯空白 → `400`（没有已生成内容就该走「重新生成」）；超上限 → `400`，再长下去请求体本身就要吃掉一块函数内存，而且这种回答多半已经跑题。
+
+### 断线续传
+
+定义在 `functions/api/src/chat/continuation.ts`（纯函数，可直接进离线评测），服务端编排在 `chat.service.ts` 的 `resumeChat()`，首发与续传共用同一个 `runTurn()`。
+
+| 环节 | 做法 | 为什么这样选 |
+|------|------|------|
+| 进度由谁携带 | **浏览器**把它已收到的文本原样带回，服务端不在内存里留「进行中」状态 | 云函数按连接调度实例，重连就是一条新连接，落到哪个实例不由我们决定，上个实例内存里的东西说没就没；浏览器手上那段反而是唯一稳定的进度 |
+| 上游怎么「继续」 | 把 `partial` 当作 `assistant` 前缀重新发一次，让模型顺着写 | Chat Completions 没有「从第 N 个 token 继续」的语义。代价说清楚：续传是一次全新请求、会重新计入一遍上下文 token，换回来的是不必从头重答、已生成部分不重复产出 |
+| 半截回答的去留 | 续传前 `dropPartialTail()` 撤掉中断那轮的半截记录，收尾时写回 `partial + 新增` 一条 | 不撤就会和续传后的完整回答并成两条；撤的条件是「末条 assistant 的内容正好是本次 partial 的前缀」，与本轮无关的既有回答一律不动 |
+| 提问缺失时 | 历史里没有这条提问就临时补一份，**不入库** | sqljs 每实例一份 `/tmp` 库，重连很可能落到从没写过这条提问的实例上；补进去的那份若入库，回到原实例就会看到同一句话两遍 |
+| 中断那轮的工具轨迹 | `mergeToolSteps()` 按 `id` 去重后接在新步骤前面 | 它们真的执行过、结果真的被用掉了，丢掉等于把已经花掉的成本从界面和下一轮上下文里抹掉 |
+| 什么错误才自动重连 | `retryableForStatus()`：408 / 429 / 5xx 可续，其余 4xx 不可续；传输层异常一律可续 | 4xx（除限流/超时）是请求本身的问题——Key 失效、模型名写错——重连只会再烧一次额度并把同一个错误复述三遍 |
+| 断线检测挂哪 | 挂 **`res` 的 `close`**，并用 `writableEnded` 区分「正常写完」与「半路被关」 | 挂 `req` 上没用：Node 在请求体读完时就发出 `req` 的 `close`，那时回答还没开始生成，控制器挂监听时事件早已过去，等于永远检测不到断线，服务端会闷头把整段跑完再落库（既继续烧额度，又让续传无从谈起） |
+| 续传用哪个模型 | 沿用中断那轮落库的 `messages.model`（仍需在候选白名单内），否则回退路由器 | 上游没有「接着上一个模型继续写」的语义，换模型续写会让前后半段风格断裂甚至自相矛盾，而浏览器手上只有文本、看不出问题出在模型换了。库里为 `null` 的旧数据（这列加之前落库的）也走回退 |
+| 前端重试节奏 | 最多 3 次，退避 `1200ms × 次数`，每次先等 `online` 事件（上限 15s） | 断网时立刻重试只会连着失败三轮；线性退避让「短暂抖动」和「真断了」在体验上区分开，耗尽后保留半截回答并提示改用「重新生成」 |
 
 ## 核心流程
 
 ### 发送消息
 
-1. 前端调用 `streamChat(conversationId, content, callbacks, signal)`；`App.tsx` 在 `pagehide` 与组件卸载时主动 `abort()`，及时停掉后端对上游的请求
+1. 前端调用 `streamChat(conversationId, content, handlers)`，回调统一收进 `ChatStreamHandlers`（`onChunk`/`onStep`/`onNotice`/`onModel`/`signal`）；`App.tsx` 在 `pagehide` 与组件卸载时主动 `abort()`，及时停掉后端对上游的请求
 2. 后端 ChatService：
    - 从 DB 读取并解密 ApiConfig，缺失直接抛 `400`
    - `ensureExists(conversationId)` 补齐缺失对话（应对多实例/冷启动）
    - 存入 user message
+   - `pickModel()` 按本轮提问算一次档位决策，**整轮（含每一轮工具迭代）都用这个模型**，并在流开头下发一条 `model` 事件（详见「场景化模型选择」）
    - `buildContext()`：一次 `loadContext()` 取回全部消息 + 摘要边界 → 扣除摘要自身占用后得到窗口预算 → `planWindow()` 从最新往回保留、旧轮次滑出 → 滑出部分 `buildRollingSummary()` 压缩并 `saveContext()` 推进边界（详见下节）
    - 保留的消息按 `toolCalls` 还原为 `assistant.tool_calls` + `role: tool` 消息，拼成 `[system, summary?, ...history]`，带上 `tools` 与 `stream: true`
    - 多轮循环（上限 `AGENT_MAX_TURNS`）：模型返回 tool_calls 就执行工具、结果回填后重新请求，直到产出纯文本
-   - 逐 chunk 透传 SSE（`content` / `tool` / `notice` / `error`）
-   - 流结束后存入 assistant message（含工具轨迹）
+   - 逐 chunk 透传 SSE（`content` / `tool` / `notice` / `model` / `error`）
+   - 流结束后存入 assistant message（含工具轨迹与本轮实际模型）
 3. 前端回调更新 UI：正文逐字追加，工具步骤在气泡内单独展示状态
+4. 中途断流（浏览器掉线、网关掐流、上游被掐）时，`runTurn()` 先把已生成的部分连同工具轨迹落库，再由前端拿它调 `/api/chat/resume` 续写，详见下节
+
+### 场景化模型选择
+
+定义在 `functions/api/src/chat/model-router.ts`（纯函数，可直接进离线评测），服务端编排只在 `chat.service.ts` 里调一次 `pickModel()`。
+目标是**同一个供应商内的几档模型按本轮问题挑一档**：不新增供应商、不改协议、不动前端配置项。
+
+| 环节 | 做法 | 为什么这样选 |
+|------|------|------|
+| 候选从哪来 | `MODEL_ROUTING_CANDIDATES` 逗号分隔，**按档位从低到高**；留空即整层关闭 | 模型名不写死在代码里：供应商的 id 会换，用户也未必开通了高那一档。配了不存在的名字会在上游拿到 4xx，宁可让配置者自己负责，也不在代码里替它兜底 |
+| 谁来判定 | 服务端算复杂度分，而不是让模型自选 | 做成模型自选要多加一个「换模型再答一遍」的工具：多一跳、双份 token、失败难归因，还会白吃掉 `AGENT_MAX_TURNS` 的轮数预算。而这里的信号（长度、是否含代码、是否要推理）本来确定可得 |
+| 判定信号 | 长度分档（≤40/≤200/≤800/更长 → 0/0.1/0.22/0.34）+ 四类关键词权重（要求深入 0.34、分析设计类 0.22、含代码 0.26、格式要求 0.12），求和封顶 1 | 「仔细/深入」这类显式要求权重最高，不该被长度压过去；封顶是为了信号叠满也不越过最高档，否则多候选时永远用最贵的 |
+| 落档 | `index = min(候选数-1, floor(score × 候选数))` | 线性映射，加第三档不用改逻辑；`min` 保证越界也只会落在最高档而不是掉出白名单 |
+| 生效范围 | 每轮请求算一次，本轮所有工具迭代沿用同一个模型 | 一次回答中途换模型，工具前后的口径会不一致；决策成本也就一次正则匹配 |
+| 界面可见 | 流开头下发 `model` 事件（id/reason/score），顶栏显示最近一条回答的模型，气泡标注该条模型并把理由放悬停 | 配置里那个主力模型名不再等于答案来源。不说清「刚才是谁答的、为什么」，用户只会觉得同一句话有时快有时慢 |
+| 落库 | 写进 `messages.model`，续传时优先沿用 | 见「断线续传」表里那一行：换模型续写会让前后半段自相矛盾 |
+| 关掉的方式 | `MODEL_ROUTING_ENABLED=false` 或候选留空 | 留一个能一键回到「恒用主力模型」的口子，对比测试和排障都靠它，不必回滚代码 |
+
+环境变量：`MODEL_ROUTING_CANDIDATES`（默认空＝关闭）、`MODEL_ROUTING_ENABLED`（默认 `true`，仅在候选非空时有意义）。
+开关与候选同时暴露在 `GET /api/health` 的 `modelRouting` / `modelCandidates`，线上「这句为什么换了个模型答」不用重新发布就能查。
 
 ### 上下文窗口与滚动摘要
 
@@ -318,7 +371,7 @@ SYSTEM_PROMPT / SUMMARY_PROMPT 从 service 里抽到 `chat/prompt.ts`，并导�
 - 版本号随 `/api/health` 暴露，`evals/cases.json` 钉住同一个版本；两边不一致时评测直接失败，强制“改提示词 → 确认预期 → 升版本”这个动作不被遗漏
 - 正文含三块：工具使用准则、工具判定示例（few-shot，只示范该不该调、调哪个、参数怎么给）、输出格式规范
 
-`npm run eval`（离线，46 项断言：19 条工具用例 + 结构与队列不变量，无需网络与 Key）覆盖：工具计算与异常、SSRF 护栏（元数据端点/回环/私网/非 http 协议）、`planWindow` 裁剪语义、并发上限与保序、`baseUrl` 归一化、工具注册表自洽（每个 spec 都有 schema 与 handler、开关只影响 `run_in_background` 的可见性、参数校验一次说清缺参/错型/多参/超长）、后台任务队列语义（终态不可复活、过期租约可回收、退避门与次数上限、kind 注册表与工具注册表口径一致、`resolve` 拒绝无人能执行的任务）、鉴权模式判定（`AUTH_ENABLED` 缺省即免登录且只认字面 `true`、与 `BACKGROUND_TASKS_ENABLED` 互不串线、兜底账号名符合 `users.username` 存储约定）。`npm run eval:online` 用 `EVAL_API_KEY` 做非流式请求，断言 `expectTool` 命中率，可用 `--min-accuracy` 卡下限；在线模式缺 Key 时报错退出而不是静默通过。运行命令见 README「回归评测」。
+`npm run eval`（离线，57 项断言：19 条工具用例 + 结构与队列、续传、路由不变量，无需网络与 Key）覆盖：工具计算与异常、SSRF 护栏（元数据端点/回环/私网/非 http 协议）、`planWindow` 裁剪语义、并发上限与保序、`baseUrl` 归一化、工具注册表自洽（每个 spec 都有 schema 与 handler、开关只影响 `run_in_background` 的可见性、参数校验一次说清缺参/错型/多参/超长）、后台任务队列语义（终态不可复活、过期租约可回收、退避门与次数上限、kind 注册表与工具注册表口径一致、`resolve` 拒绝无人能执行的任务）、鉴权模式判定（`AUTH_ENABLED` 缺省即免登录且只认字面 `true`、与 `BACKGROUND_TASKS_ENABLED` 互不串线、兜底账号名符合 `users.username` 存储约定）、断点续传的上下文拼装不变量（前缀顺序、半截去重、缺问补份、拒绝条件、可重试返回码、工具轨迹合并不重不漏）、模型路由分档不变量（未配置或显式关闭恒等主力、候选解析与低到高顺序、分数线性落档且封顶不越白名单、续传沿用白名单内的中断那轮模型、缺记录或模型已下架时回退路由器）。`npm run eval:online` 用 `EVAL_API_KEY` 做非流式请求，断言 `expectTool` 命中率，可用 `--min-accuracy` 卡下限；在线模式缺 Key 时报错退出而不是静默通过。运行命令见 README「回归评测」。
 
 > 评测集已经发现过两个真实缺陷：calculator 的标识符正则不含数字，`log10(1000)` 被切成 `log`+`10` 报“需要括号参数”；另一个是用例自写错（期望“星期X”，工具实际输出“周日”）—— 后者提醒断言要对着实现写，而不是对着描述文字写。
 
@@ -349,18 +402,18 @@ SYSTEM_PROMPT / SUMMARY_PROMPT 从 service 里抽到 `chat/prompt.ts`，并导�
 
 | 文件 | 职责 |
 |------|------|
-| `frontend/src/client.ts` | 封装所有后端 HTTP/SSE 调用（含 `truncateConversation`）；统一管理 token（localStorage）与 `Authorization` 头，任一接口 401 时广播 `ai-chat:unauthorized` 让 App 收回登录态；`fetchAuthMode` 问后端当前是否免登录，拿不到结果就按需要真实登录处理 |
+| `frontend/src/client.ts` | 封装所有后端 HTTP/SSE 调用（含 `truncateConversation`、`resumeChat`）；`streamChat` 与 `resumeChat` 共用同一个 `runChatStream`，只有路径和请求体不同，回调统一收进 `ChatStreamHandlers` 对象——`onChunk`/`onNotice` 签名一模一样，再排位置参数就会悄悄接错而 TS 抓不到同类型的顺序错误；流没等到 `[DONE]` 就结束时抛 `ChatStreamError(…, retryable=true)`，把「网关掐流」和「正常写完」区分开；`model` 事件转成 `onModel`，界面据此说明「刚才是哪个模型答的」；统一管理 token（localStorage）与 `Authorization` 头，任一接口 401 时广播 `ai-chat:unauthorized` 让 App 收回登录态；`fetchAuthMode` 问后端当前是否免登录，拿不到结果就按需要真实登录处理 |
 | `frontend/src/apiConfig.ts` | PROVIDER_PRESETS（给 Modal UI 渲染用）、表单校验工具 |
-| `frontend/src/types.ts` | Message / Conversation / ApiConfig / ProviderType 类型 |
-| `frontend/src/App.tsx` | 状态管理：登录态、会话列表、当前会话、配置状态；首屏先问 `/api/auth/mode`，免登录时直接以返回的身份进入主界面，否则用 token 换登录态，未登录只渲染 `AuthView`；登录后没配 Key 自动弹设置窗；`rewindTo` 统一承载“重新生成”与“编辑重发”（先改后端再同步本地）；`pagehide`/卸载时 abort 在途 SSE |
+| `frontend/src/types.ts` | Message / Conversation / ApiConfig / ProviderType 类型；Message 上的 `model` 是本轮实际作答的模型（历史消息从库里读回，只有名字），`modelReason` 只在流式那一轮存在 |
+| `frontend/src/App.tsx` | 状态管理：登录态、会话列表、当前会话、配置状态；首屏先问 `/api/auth/mode`，免登录时直接以返回的身份进入主界面，否则用 token 换登录态，未登录只渲染 `AuthView`；登录后没配 Key 自动弹设置窗；`rewindTo` 统一承载“重新生成”与“编辑重发”（先改后端再同步本地）；发送链路自带续传循环 `resumeFromBreak`：`generated` 累积本轮已渲染文本，遇到 `retryable` 错误就先等 `online` 再退避重试，把 `generated` 当 `partial` 续写，最多 3 次，耗尽或不可续时保留半截回答并给出明确结尾；`onModel` 把服务端的路由决策写进当前 assistant 气泡（`model` + `modelReason`），续传那轮收到的理由会覆盖首发那轮的，因为「沿用」才是此刻的事实；`pagehide`/卸载时 abort 在途 SSE |
 | `frontend/src/components/AuthView.tsx` | 登录/注册页：模式切换、前置长度校验、错误提示、提交中禁用按钮 |
-| `frontend/src/components/ChatInterface.tsx` | 纯 UI：侧栏 + 气泡 + 输入框 + Markdown 渲染 + 工具步骤面板；“重新生成”仅给最后一条回答，“编辑重发”仅给历史用户消息；顶栏展示当前账号与「退出登录」（生成中禁用），`demoMode` 下账号旁加「免登录」标记并收起退出登录按钮——没有 token 可清，留着按钮只会给出一个点了没反应的入口 |
+| `frontend/src/components/ChatInterface.tsx` | 纯 UI：侧栏 + 气泡 + 输入框 + Markdown 渲染 + 工具步骤面板；“重新生成”仅给最后一条回答，“编辑重发”仅给历史用户消息；顶栏展示当前账号与「退出登录」（生成中禁用）；那个模型名取**最近一条带模型标记的回答**（没有才退回配置里的主力模型），气泡下方标出该条自己的模型、悬停给理由——一次会话里不同问题的档位可以不同，逐条标注才答得出「这句是谁说的」；`demoMode` 下账号旁加「免登录」标记并收起退出登录按钮——没有 token 可清，留着按钮只会给出一个点了没反应的入口 |
 | `frontend/src/components/ApiConfigModal.tsx` | 配置弹窗 UI：供应商选择 + Key/Model/BaseURL 表单 |
 | `frontend/src/components/TaskPanel.tsx` | 后台任务面板（顶栏入口 + 抽屉）：自拉数据、不向 App 要 prop；有活跃任务且抽屉打开时 2s 轮询，否则降到 15s；`runnerEnabled=false` 时明确解释「任务只会排队」；提交表单按 `/api/tasks/meta/kinds` 的字段说明渲染；取消按钮只对进行中的任务出现，终态只展示结果 |
 
 ## 扩展方向
 
-已落地（不再是待办）：多用户账号与数据隔离、免登录演示模式（`AUTH_ENABLED` 单开关，与真实登录共存）、CloudBase 静态托管 + HTTP 云函数部署、工具并发执行、上下文窗口裁剪 + 滚动摘要、重新生成 / 编辑重发、提示词版本化 + 回归评测、后台任务的队列表与 REST 接口。
+已落地（不再是待办）：多用户账号与数据隔离、免登录演示模式（`AUTH_ENABLED` 单开关，与真实登录共存）、CloudBase 静态托管 + HTTP 云函数部署、工具并发执行、上下文窗口裁剪 + 滚动摘要、重新生成 / 编辑重发、SSE 断线自动续传、同供应商内的场景化模型选择、提示词版本化 + 回归评测、后台任务的队列表与 REST 接口。
 
 - 数据层根治：把 `DB_TYPE` 切到 `postgres`，消除多实例/冷启动导致的配置与历史丢失（当前所有“演示模式局限”的根因）
 - 对话分支：`truncateFrom` 已经是它的地基，缺的是一份“父消息/分支树”数据模型与前端切换 UI

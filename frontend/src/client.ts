@@ -232,6 +232,7 @@ export async function fetchConversation(id: string): Promise<Conversation> {
       content: string
       timestamp: number
       toolCalls: string | null
+      model: string | null
     }>
   }
   return {
@@ -274,6 +275,7 @@ export async function fetchConversation(id: string): Promise<Conversation> {
         content: m.content,
         timestamp: m.timestamp,
         ...(steps ? { steps } : {}),
+        ...(m.model ? { model: m.model } : {}),
       }
     }),
   }
@@ -426,72 +428,169 @@ export async function cancelTask(id: string): Promise<BackgroundTask> {
 
 // --- Chat (SSE stream) ---
 
-export async function streamChat(
-  conversationId: string,
-  content: string,
-  onChunk: (text: string) => void,
-  onStep: (step: ToolStep) => void,
-  onNotice: (text: string) => void,
-  signal?: AbortSignal,
+/**
+ * 流被打断。
+ *
+ * retryable=true 表示界面上已经渲染出来的那段还有救：拿它调 resumeChat 续写后半段。
+ * 密钥失效、额度不足这类是 false——重试只会再烧一次额度并把同一句报错再说一遍。
+ */
+export class ChatStreamError extends Error {
+  readonly retryable: boolean
+
+  constructor(message: string, retryable: boolean) {
+    super(message)
+    this.name = 'ChatStreamError'
+    this.retryable = retryable
+  }
+}
+
+/** 用户主动停止或离开页面：这不是故障，半截回答要原样留着 */
+export function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === 'AbortError'
+}
+
+/**
+ * 一路 SSE 的回调集合。
+ *
+ * 用对象而不是继续往下排位置参数：onChunk / onNotice 签名一模一样，
+ * 再加一个回调就可能悄悄接错，而 TS 抓不到同类型的顺序错误。
+ */
+export interface ChatStreamHandlers {
+  onChunk: (text: string) => void
+  onStep: (step: ToolStep) => void
+  onNotice: (text: string) => void
+  /** 本轮实际使用的模型与选择理由：服务端按场景路由后，配置里那个主力模型名不再等于答案来源 */
+  onModel?: (info: ModelInfo) => void
+  signal?: AbortSignal
+}
+
+export interface ModelInfo {
+  id: string
+  reason: string
+  score: number
+}
+
+async function runChatStream(
+  path: string,
+  body: unknown,
+  handlers: ChatStreamHandlers,
 ): Promise<void> {
-  const res = await authedFetch('/chat', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ conversationId, content }),
-    signal,
-  })
+  const { onChunk, onStep, onNotice, onModel, signal } = handlers
+  let res: Response
+  try {
+    res = await authedFetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal,
+    })
+  } catch (error) {
+    if (isAbortError(error)) {
+      throw error
+    }
+    // 连接压根没建立（离线、DNS、网关故障），此时没有任何可续传的进度
+    throw new ChatStreamError('无法连接到后端服务，请检查网络后重试。', true)
+  }
 
   if (!res.ok) {
     const data = (await res.json().catch(() => null)) as
       | { message?: string | string[]; error?: string }
       | null
     // 流没建立时后端仍走普通 JSON 错误响应，直接把 message 当提示用
-    throw new Error(errorMessageFrom(data) || `请求失败（${res.status}）`)
+    throw new ChatStreamError(errorMessageFrom(data) || `请求失败（${res.status}）`, false)
   }
 
   if (!res.body) {
-    throw new Error('未返回可读取的流')
+    throw new ChatStreamError('未返回可读取的流', false)
   }
 
   const reader = res.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
+  let completed = false
 
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
 
-    buffer += decoder.decode(value, { stream: true })
-    const lines = buffer.split('\n')
-    buffer = lines.pop() ?? ''
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() ?? ''
 
-    for (const line of lines) {
-      const trimmed = line.trim()
-      if (!trimmed.startsWith('data:')) continue
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (!trimmed.startsWith('data:')) continue
 
-      const payload = trimmed.slice(5).trim()
-      if (!payload || payload === '[DONE]') continue
-
-      try {
-        const parsed = JSON.parse(payload)
-        if (parsed.error) {
-          throw new Error(parsed.error)
+        const payload = trimmed.slice(5).trim()
+        if (!payload) continue
+        if (payload === '[DONE]') {
+          completed = true
+          continue
         }
-        // 流内非致命提示（如输出被长度上限截断）：交给界面展示，不中断流
-        if (parsed.notice) {
-          onNotice(String(parsed.notice))
+
+        try {
+          const parsed = JSON.parse(payload)
+          if (parsed.error) {
+            throw new ChatStreamError(String(parsed.error), parsed.retryable === true)
+          }
+          // 流内非致命提示（如回答被长度上限截断）：交给界面展示，不中断流
+          if (parsed.notice) {
+            onNotice(String(parsed.notice))
+          }
+          // 模型路由事件：一条流开头发一次，界面据此说明「刚才是哪个模型在答」
+          if (parsed.model) {
+            onModel?.(parsed.model as ModelInfo)
+          }
+          if (parsed.content) {
+            onChunk(parsed.content)
+          }
+          // Agent 工具调用事件：calling 新增步骤，done/error 更新同 id 步骤
+          if (parsed.tool) {
+            onStep(parsed.tool as ToolStep)
+          }
+        } catch (error) {
+          if (error instanceof SyntaxError) continue
+          throw error
         }
-        if (parsed.content) {
-          onChunk(parsed.content)
-        }
-        // Agent 工具调用事件：calling 新增步骤，done/error 更新同 id 步骤
-        if (parsed.tool) {
-          onStep(parsed.tool as ToolStep)
-        }
-      } catch (error) {
-        if (error instanceof SyntaxError) continue
-        throw error
       }
     }
+  } catch (error) {
+    if (error instanceof ChatStreamError || isAbortError(error)) {
+      throw error
+    }
+    // reader 抛错基本都是 TCP 连接被掐：已经收到的那部分是真实进度，可以续
+    throw new ChatStreamError('与后端的连接中断了。', true)
   }
+
+  if (!completed) {
+    // 没等到 [DONE] 就结束：网关掐流、函数超时会这样。当成「未完成」而不是「完成」，
+    // 否则半截回答会被静默视作完整结果，界面连续传的机会都没有
+    throw new ChatStreamError('连接在完成前中断。', true)
+  }
+}
+
+export function streamChat(
+  conversationId: string,
+  content: string,
+  handlers: ChatStreamHandlers,
+): Promise<void> {
+  return runChatStream('/chat', { conversationId, content }, handlers)
+}
+
+/**
+ * 断点续传：partial 是浏览器已经渲染的前半段，服务端接着它往下写，回调只收到后半段。
+ *
+ * 进度由客户端携带而不是服务端缓存：云函数按连接调度实例，重连落到哪个实例不可控，
+ * 上个实例的内存和它那份 /tmp 库都可能不是这一轮的现场。上游也没有「从第 N 个 token
+ * 继续」的语义，所以这是一次新请求、会重新计一遍上下文 token，换回来的是不重复生成、
+ * 用户看到的仍是一条连贯回答。
+ */
+export function resumeChat(
+  conversationId: string,
+  content: string,
+  partial: string,
+  handlers: ChatStreamHandlers,
+): Promise<void> {
+  return runChatStream('/chat/resume', { conversationId, content, partial }, handlers)
 }

@@ -151,12 +151,49 @@ export class ConversationsService {
     return { removed: doomed.length, summaryReset }
   }
 
+  /**
+   * 续传前撤掉上一轮留下的半截回答。
+   *
+   * 浏览器断连时本服务会走中断分支把已生成部分入库，续传完成后又要写一条完整的，
+   * 两条并存就成了「同一句话回答了两遍、后半截那条还短」。
+   *
+   * 只删末条且必须与续传前缀同源（互为前缀）：半截回答一定排在最后，
+   * 而上一轮那条完整回答不可能这次又被当成半截生成出来。
+   * 删的动作交给 truncateFrom，摘要越界的作废逻辑也就一并复用了。
+   */
+  async dropPartialTail(
+    userId: string,
+    id: string,
+    partial: string,
+  ): Promise<{ removed: boolean; toolCalls: string | null; model: string | null }> {
+    if (!partial) {
+      return { removed: false, toolCalls: null, model: null }
+    }
+
+    const conv = await this.owned(userId, id, { messages: true })
+    const last = [...conv.messages].sort((a, b) => a.timestamp - b.timestamp).pop()
+    if (!last || last.role !== 'assistant' || !last.content) {
+      return { removed: false, toolCalls: null, model: null }
+    }
+
+    const sameTurn =
+      partial.startsWith(last.content) || last.content.startsWith(partial)
+    if (!sameTurn) {
+      return { removed: false, toolCalls: null, model: null }
+    }
+
+    const { toolCalls, model } = last
+    await this.truncateFrom(userId, id, last.timestamp)
+    return { removed: true, toolCalls, model: model ?? null }
+  }
+
   async addMessage(
     userId: string,
     conversationId: string,
     role: 'user' | 'assistant',
     content: string,
     steps?: Array<{ id: string; name: string; arguments: string; result: string; ok: boolean }>,
+    model?: string | null,
   ): Promise<Message> {
     const conv = await this.owned(userId, conversationId)
     const msg = this.msgRepo.create({
@@ -164,6 +201,7 @@ export class ConversationsService {
       content,
       // 工具轨迹序列化为 JSON，便于下轮会话还原 OpenAI 协议的 tool_calls 结构
       toolCalls: steps && steps.length ? JSON.stringify(steps) : null,
+      model: model ?? null,
       timestamp: Date.now(),
       conversation: conv,
     })

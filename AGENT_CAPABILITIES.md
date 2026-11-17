@@ -37,6 +37,7 @@
 | 同一轮多个 `tool_calls` 并发执行 | [chat.service.ts:330](file:///D:/MyProject/ai-chat/functions/api/src/chat/chat.service.ts#L330) + [tool-runner.ts:16](file:///D:/MyProject/ai-chat/functions/api/src/agent/tool-runner.ts#L16) | 并发上限 `AGENT_TOOL_CONCURRENCY`（默认 4，[chat.service.ts:24](file:///D:/MyProject/ai-chat/functions/api/src/chat/chat.service.ts#L24)），为何必须封顶见 `TECH_DESIGN.md`「工具并发执行」 |
 | 结果按 `tool_calls` 原顺序回填 | [chat.service.ts:339](file:///D:/MyProject/ai-chat/functions/api/src/chat/chat.service.ts#L339) | 展示顺序不受完成顺序影响，前端靠 `tool_call_id` 对位更新 |
 | 失败后带错误结果继续收敛 | [chat.service.ts:362](file:///D:/MyProject/ai-chat/functions/api/src/chat/chat.service.ts#L362) | 工具异常文本回灌模型，提示词要求其说明原因并调整参数重试 |
+| 本轮用哪个模型由服务端按问题复杂度分档挑 | [model-router.ts:82](file:///D:/MyProject/ai-chat/functions/api/src/chat/model-router.ts#L82) | 候选来自 `MODEL_ROUTING_CANDIDATES`（**从低到高**），留空即恒用配置里的主力模型；一次请求只决策一次，本轮所有工具迭代沿用同一个模型 |
 
 ---
 
@@ -54,7 +55,7 @@
 | ✅ | 用户侧 REST 接口（列表 / 提交 / 详情 / 取消 / kind 元信息），越权统一 404 | [tasks.controller.ts](file:///D:/MyProject/ai-chat/functions/api/src/tasks/tasks.controller.ts) |
 | ✅ | `run_in_background`：模型自主提交长任务，只回任务编号，明确告知「本轮回答里还没有它」 | [tools.ts:476](file:///D:/MyProject/ai-chat/functions/api/src/agent/tools.ts#L476) |
 | ✅ | 前端「后台任务」面板：轮询进度、展示结果与错误、可取消 | [TaskPanel.tsx](file:///D:/MyProject/ai-chat/frontend/src/components/TaskPanel.tsx) |
-| ✅ | 队列水位与开关随 `/api/health` 暴露（`background` / `tasks`） | [health.controller.ts:44](file:///D:/MyProject/ai-chat/functions/api/src/health/health.controller.ts#L44) |
+| ✅ | 队列水位与开关随 `/api/health` 暴露（`background` / `tasks` / `modelRouting` / `modelCandidates`） | [health.controller.ts:44](file:///D:/MyProject/ai-chat/functions/api/src/health/health.controller.ts#L44) |
 | ❌ | **执行器进程**：目前没有调用方，提交的任务会一直停在 `queued`；`BACKGROUND_TASKS_ENABLED` 因此保持 `false` | 部署形态与约束见 `TECH_DESIGN.md`「后台任务队列」 |
 
 关闭时的行为是有意的：不广播 `run_in_background`，模型就只会直接调用工具或在回答里说明无法后台，而不是造出一堆无人执行的任务。
@@ -77,11 +78,13 @@
 
 ## 5. 运行过程的前端可见性
 
-- SSE 事件顺序：`tool(calling)`×N → `tool(done|error)`×N → `content` 逐字 → `notice?` → `data: [DONE]`
+- SSE 事件顺序：`model`（本轮实际模型与理由）→ `tool(calling)`×N → `tool(done|error)`×N → `content` 逐字 → `notice?` → `data: [DONE]`
+- 顶栏显示最近一条回答**实际用的模型**，每条回答自己标一份（悬停给理由）；配置里那个主力模型名不再等于答案来源
 - 工具步骤在消息气泡内以面板形式展开，含入参、状态与返回文本
 - 等待首个 token 期间有生成中的 loading 指示，避免空气泡看不出正在响应
 - 后台任务进度走轮询而不是 SSE：任务比一次连接活得久，断线重连与多标签页都不该依赖长连接（面板 2s / 15s 两档）
-- 上游流消费与 `tool_calls` 分片累积：[chat.service.ts:419](file:///D:/MyProject/ai-chat/functions/api/src/chat/chat.service.ts#L419)
+- 聊天流断掉时界面先保留已渲染的半截，再显示「连接中断，正在第 N/3 次自动续传…」，续写完成后合并成一条回答并标注「网络曾中断，回答已从断点续写完成」；重试次数耗尽则保留半截并提示改用「重新生成」
+- 上游流消费与 `tool_calls` 分片累积：[chat.service.ts:559](file:///D:/MyProject/ai-chat/functions/api/src/chat/chat.service.ts#L559)
 
 ---
 
@@ -89,11 +92,17 @@
 
 | 场景 | 行为 | 位置 |
 |------|------|------|
-| 上游 `finish_reason: length`（输出被截断） | 下发 `notice`，提示回复「继续」 | [chat.service.ts:488](file:///D:/MyProject/ai-chat/functions/api/src/chat/chat.service.ts#L488) |
-| 循环耗尽仍无正文且末轮以 `tool_calls` 结束 | 明确报「连续调用工具达 N 轮上限」 | [chat.service.ts:382](file:///D:/MyProject/ai-chat/functions/api/src/chat/chat.service.ts#L382) |
-| 循环耗尽且无任何文本（非工具结尾） | 报「可能被输出长度上限截断」 | [chat.service.ts:383](file:///D:/MyProject/ai-chat/functions/api/src/chat/chat.service.ts#L383) |
-| 用户中断（`AbortError`） | 保留已生成的半截回答与工具轨迹并落库 | [chat.service.ts:400](file:///D:/MyProject/ai-chat/functions/api/src/chat/chat.service.ts#L400) |
-| 上游 401/403/429/其他 | 翻译成中文可操作提示，附带状态码 | [chat.service.ts:509](file:///D:/MyProject/ai-chat/functions/api/src/chat/chat.service.ts#L509) |
+| 上游 `finish_reason: length`（输出被截断） | 下发 `notice`，提示回复「继续」 | [chat.service.ts:625](file:///D:/MyProject/ai-chat/functions/api/src/chat/chat.service.ts#L625) |
+| 循环耗尽仍无正文且末轮以 `tool_calls` 结束 | 明确报「连续调用工具达 N 轮上限」 | [chat.service.ts:522](file:///D:/MyProject/ai-chat/functions/api/src/chat/chat.service.ts#L522) |
+| 循环耗尽且无任何文本（非工具结尾） | 报「可能被输出长度上限截断」 | [chat.service.ts:523](file:///D:/MyProject/ai-chat/functions/api/src/chat/chat.service.ts#L523) |
+| 用户中断（`AbortError`） | 保留已生成的半截回答与工具轨迹并落库 | [chat.service.ts:536](file:///D:/MyProject/ai-chat/functions/api/src/chat/chat.service.ts#L536) |
+| 浏览器掉线 / 网关掐断连接 | `res` 的 `close` 触发中止，上游那次请求随即停掉，半截回答照样落库 | [chat.controller.ts:16](file:///D:/MyProject/ai-chat/functions/api/src/chat/chat.controller.ts#L16) |
+| 传输层异常（上游被掐、读流抛错） | 落库半截 + 下发 `error` 且 `retryable: true`，前端据此自动续传 | [chat.service.ts:544](file:///D:/MyProject/ai-chat/functions/api/src/chat/chat.service.ts#L544) |
+| 上游返回码是否值得自动重连 | 408 / 429 / 5xx 可续，其余 4xx 判死（Key 失效、模型名写错重连只会再烧一次额度） | [continuation.ts:73](file:///D:/MyProject/ai-chat/functions/api/src/chat/continuation.ts#L73) |
+| 续传带回的半截回答 | 以它为 assistant 前缀只补后半段；撤掉中断那轮的重复记录，收尾合成一条 | [chat.service.ts:283](file:///D:/MyProject/ai-chat/functions/api/src/chat/chat.service.ts#L283) |
+| `partial` 为空 / 纯空白 / 超 30000 字符 | 直接 400 并说明「请重新生成」，不做无意义续传 | [chat-request.dto.ts:22](file:///D:/MyProject/ai-chat/functions/api/src/chat/chat-request.dto.ts#L22) |
+| 续传那轮用哪个模型 | 沿用中断那轮落库的 `messages.model`（仍需在候选白名单内），库里为 `null` 或该模型已下架才回退路由器——换模型续写会让前后半段自相矛盾 | [model-router.ts:109](file:///D:/MyProject/ai-chat/functions/api/src/chat/model-router.ts#L109) |
+| 上游 401/403/429/其他 | 翻译成中文可操作提示，附带状态码 | [chat.service.ts:630](file:///D:/MyProject/ai-chat/functions/api/src/chat/chat.service.ts#L630) |
 | 模型给出注册表里没有的工具名 | `executeTool` 返回「未知工具：x」文本，不抛异常打断本轮 | [tools.ts:543](file:///D:/MyProject/ai-chat/functions/api/src/agent/tools.ts#L543) |
 | 提交无人能执行的后台任务（未知 kind / 不可后台的工具 / 参数不合法 / payload 过大） | 接口直接 400，错误文本带上可用清单与上限 | [task.service.ts:52](file:///D:/MyProject/ai-chat/functions/api/src/tasks/task.service.ts#L52) |
 | 任务被用户取消后执行器才跑完 | 终态不可回退，迟到结果被丢弃（`canTransition` 拒绝） | [task-policy.ts:105](file:///D:/MyProject/ai-chat/functions/api/src/tasks/task-policy.ts#L105) |
@@ -103,7 +112,7 @@
 ## 7. 提示词与评测
 
 - 提示词与工具描述集中在 `chat/prompt.ts` 并版本化，[evals/cases.json](file:///D:/MyProject/ai-chat/functions/api/evals/cases.json) 钉住同一版本号：两边不一致评测直接失败
-- 离线回归 `npm run eval`（[functions/api/package.json:14](file:///D:/MyProject/ai-chat/functions/api/package.json#L14)）：46 项断言覆盖工具结果、异常路径、SSRF 护栏、上下文裁剪、并发语义，工具注册表与任务队列的结构不变量，以及鉴权模式判定（只认字面 `true`、与后台任务开关互不串线），无需网络与 Key
+- 离线回归 `npm run eval`（[functions/api/package.json:14](file:///D:/MyProject/ai-chat/functions/api/package.json#L14)）：57 项断言覆盖工具结果、异常路径、SSRF 护栏、上下文裁剪、并发语义，工具注册表与任务队列的结构不变量、鉴权模式判定（只认字面 `true`、与后台任务开关互不串线）、断点续传的上下文拼装不变量（前缀顺序、半截去重、缺问补份、拒绝条件、可重试返回码、工具轨迹合并不重不漏），以及模型路由的分档不变量（未配置或显式关闭恒等主力、候选解析与低到高顺序、分数线性落档且封顶不越白名单、续传沿用白名单内的中断那轮模型、缺记录或模型已下架时回退路由器），无需网络与 Key
 - 在线评测 `npm run eval:online`（[functions/api/package.json:15](file:///D:/MyProject/ai-chat/functions/api/package.json#L15)）：只看模型选了哪个工具，按分类统计命中率；缺 `EVAL_API_KEY` 直接报错退出，不会静默通过
 
 用例覆盖清单与“为什么这样设计”见 `TECH_DESIGN.md`「提示词版本化与回归评测」。
@@ -117,7 +126,9 @@
 - 图像/语音的生成与理解（且配置层禁止把文生图模型用于聊天）
 - 跨会话长期记忆：只有同一会话内的滚动摘要，没有知识库检索
 - 多供应商：预设仍只有 DeepSeek（兼容 OpenAI Chat Completions + tools）
+- 跨供应商/跨模态的模型选择：路由只在**同一供应商的文本档位**之间换档。它不会因此获得图像理解，也不会做可用性探测——候选写成别的供应商或没开通的模型，只会在请求上游时拿到 4xx
 - 流式工具结果：工具返回值一次性给出，不边生成边推送
+- 断点续传的「服务端进度缓存」：不在内存里留进行中状态，进度由浏览器携带；上游也没有「从第 N 个 token 继续」的语义，续传是一次全新请求、会重新计入一遍上下文 token
 - **后台任务的执行器**：队列与接口已就绪，缺常驻进程领取并执行，因此任务只会排队（见「3. 后台长任务」）
 - 定时任务：没有 cron 触发器，`tasks` 表也没有 `scheduledAt` 之类的字段
 - 多智能体编排与子任务委派：单循环单模型
@@ -134,6 +145,8 @@
 | `AGENT_TOOL_CONCURRENCY` | 4 | 一轮内并发执行的工具数上限 |
 | `CONTEXT_TOKEN_BUDGET` | 6000 | 历史消息可用 token 预算（不含 system 与摘要本身） |
 | `CONTEXT_SUMMARY_ENABLED` | true | 关闭则退回「只裁剪不压缩」 |
+| `MODEL_ROUTING_CANDIDATES` | 空 | 候选档位**从低到高**逗号分隔；留空等于不开启，回答恒用配置里的主力模型。填该账号确实开通的模型 id |
+| `MODEL_ROUTING_ENABLED` | true | `false` 则只按主力模型作答，用于对比测试或排障（候选为空时本项无意义） |
 | `BACKGROUND_TASKS_ENABLED` | false | 是否向模型广播 `run_in_background`；执行器上线前必须保持关闭 |
 | `TASK_LEASE_MS` | 120000 | 执行器存活证明有效期；崩溃后任务最长被占用这么久，之后可被别的实例回收 |
 | `TASK_MAX_ATTEMPTS` | 3 | 单个任务最多执行几次（含首次），超过判 `failed` |

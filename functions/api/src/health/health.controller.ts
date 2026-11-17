@@ -4,6 +4,7 @@ import { DataSource } from 'typeorm'
 import { SecretCipher } from '../security/secret-cipher'
 import { TasksService } from '../tasks/task.service'
 import { backgroundTasksEnabled } from '../tasks/task-policy'
+import { routingCandidates, routingEnabled } from '../chat/model-router'
 import { PROMPT_VERSION } from '../chat/prompt'
 import { Public } from '../auth/auth.decorators'
 import { authEnabled } from '../auth/auth-mode'
@@ -46,6 +47,10 @@ export class HealthController {
       auth: authEnabled() ? 'enabled' : 'disabled',
       // 队列水位：background 为 disabled 而 queued 在涨，说明任务正无人执行地堆积
       background: backgroundTasksEnabled() ? 'enabled' : 'disabled',
+      // 模型路由：候选档位从低到高。空数组等于没开，回答恒用配置里的主力模型。
+      // 线上「这句为什么换了个模型答」要能在这里直接查到，不用重新发布
+      modelRouting: routingEnabled() ? 'enabled' : 'disabled',
+      modelCandidates: routingCandidates(),
       tasks: await this.tasks.stats(),
       uptime: Math.round(process.uptime()),
       timestamp: new Date().toISOString(),

@@ -17,6 +17,10 @@ export interface Message {
   timestamp: number
   /** Agent 本轮自主调用工具的过程 */
   steps?: ToolStep[]
+  /** 本轮实际作答的模型：服务端按场景路由后，配置里那个名字不再等于答案来源 */
+  model?: string
+  /** 为什么是这个模型，只在流式那一轮有；历史消息只有模型名 */
+  modelReason?: string
 }
 
 export interface Conversation {

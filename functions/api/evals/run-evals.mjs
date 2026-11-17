@@ -9,7 +9,7 @@
  * 两种模式：
  *   离线（默认）  不需要网络、不需要 API Key。直接调用编译产物里的 executeTool，
  *                断言工具自身的计算/护栏行为，外加提示词版本一致性、窗口裁剪语义、
- *                并发上限这几类纯本地不变量。适合每次改完代码就跑。
+ *                并发上限、断点续传上下文、模型路由分档这几类纯本地不变量。适合每次改完代码就跑。
  *   在线（--online）读取 EVAL_API_KEY 等环境变量，用非流式请求让模型自己选工具，
  *                断言 expectTool 命中率。这会真实消耗 token，只在改提示词后跑。
  *
@@ -128,6 +128,8 @@ let llmClient
 let taskPolicy
 let taskRegistry
 let authMode
+let continuation
+let modelRouter
 
 try {
   prompt = loadDist('chat/prompt.js')
@@ -139,6 +141,8 @@ try {
   taskPolicy = loadDist('tasks/task-policy.js')
   taskRegistry = loadDist('tasks/task-registry.js')
   authMode = loadDist('auth/auth-mode.js')
+  continuation = loadDist('chat/continuation.js')
+  modelRouter = loadDist('chat/model-router.js')
 } catch (error) {
   console.error(`[evals] ${error.message}`)
   process.exit(1)
@@ -731,6 +735,217 @@ check('兜底演示账号名符合 users.username 的存储约定', () => {
   assert(name.length <= 32, `DEMO_USERNAME 超过 username 列长度上限：${name.length}`)
   assert(!/[^a-z0-9_-]/.test(name), `DEMO_USERNAME 含非常规字符：${name}`)
   return name
+})
+
+// ---------------------------------------------------------------- 离线：断点续传
+
+suite('resume')
+
+const { buildContinuationMessages, retryableForStatus, mergeToolSteps, ResumeRejectedError, MAX_RESUME_PARTIAL_CHARS } =
+  continuation
+
+check('续传上下文固定为 …历史 → 提问 → 半截前缀', () => {
+  const msgs = buildContinuationMessages(
+    [
+      { role: 'user', content: '第一问' },
+      { role: 'assistant', content: '第一答' },
+    ],
+    '背四个字',
+    '甲乙',
+  )
+  assert(
+    JSON.stringify(msgs.map((m) => m.role)) === JSON.stringify(['user', 'assistant', 'user', 'assistant']),
+    `角色顺序走样：${JSON.stringify(msgs.map((m) => m.role))}`,
+  )
+  assert(msgs.at(-1).content === '甲乙', '末条必须是已生成的半截，模型才会顺着写')
+  assert(msgs.at(-2).content === '背四个字', '提问不在半截前面，模型会当成新的一轮作答')
+  return '4 条'
+})
+
+check('半截已在历史末尾就不重复，提问缺失才补一份', () => {
+  // 中断那次已把「甲乙」落库，重连时它既在历史里又被当作前缀，不去掉就会发两遍
+  const withPartialInHistory = buildContinuationMessages(
+    [
+      { role: 'user', content: '背四个字' },
+      { role: 'assistant', content: '甲乙' },
+    ],
+    '背四个字',
+    '甲乙',
+  )
+  assert(
+    withPartialInHistory.filter((m) => m.content === '甲乙').length === 1,
+    `半截重复了：${JSON.stringify(withPartialInHistory.map((m) => m.content))}`,
+  )
+  assert(
+    withPartialInHistory.filter((m) => m.role === 'user').length === 1,
+    '提问已在原位还补，模型会看到同一个问题问了两遍',
+  )
+
+  // 换实例后库里没有这条提问：补进上下文，但只补一份
+  const missingQuestion = buildContinuationMessages([{ role: 'assistant', content: '甲乙' }], '背四个字', '甲乙')
+  assert(
+    missingQuestion.filter((m) => m.role === 'user' && m.content === '背四个字').length === 1,
+    '缺失的提问没有补进上下文，续写会答非所问',
+  )
+
+  // 入参历史还要被别处复用，函数不能就地改它
+  const history = [{ role: 'user', content: '原话' }]
+  buildContinuationMessages(history, '原话', '前半段')
+  assert(history.length === 1, `入参历史被改写了：${JSON.stringify(history)}`)
+  return '去重 + 补问 + 无副作用'
+})
+
+check('空/纯空白/超上限的半截一律拒绝续传', () => {
+  const history = [{ role: 'user', content: '问' }]
+  for (const partial of ['', '   ', '\n\t']) {
+    let threw = null
+    try {
+      buildContinuationMessages(history, '问', partial)
+    } catch (error) {
+      threw = error
+    }
+    assert(threw instanceof ResumeRejectedError, `空白半截 "${partial}" 竟然允许续传`)
+  }
+
+  const atLimit = '字'.repeat(MAX_RESUME_PARTIAL_CHARS)
+  assert(
+    buildContinuationMessages(history, '问', atLimit).at(-1).content === atLimit,
+    '刚好到上限的半截不该被拒',
+  )
+  let over = null
+  try {
+    buildContinuationMessages(history, '问', '字'.repeat(MAX_RESUME_PARTIAL_CHARS + 1))
+  } catch (error) {
+    over = error
+  }
+  assert(over instanceof ResumeRejectedError, '超出上限仍允许续传，请求体本身就会吃掉函数内存')
+  return `上限 ${MAX_RESUME_PARTIAL_CHARS}`
+})
+
+check('重试判定只认临时故障，密钥/参数类 4xx 不许自动重连', () => {
+  for (const status of [408, 429, 500, 502, 503, 504]) {
+    assert(retryableForStatus(status) === true, `${status} 属于临时故障，应可续传`)
+  }
+  for (const status of [400, 401, 403, 404, 413, 422]) {
+    assert(retryableForStatus(status) === false, `${status} 是请求本身的问题，重连只会再烧一次额度`)
+  }
+  return '12 个返回码'
+})
+
+check('中断那轮的工具轨迹合并不重不漏、保持原顺序', () => {
+  const prior = [
+    { id: 'a', name: 'calc' },
+    { id: 'b', name: 'fetch_url' },
+  ]
+  const next = [
+    { id: 'b', name: 'fetch_url' },
+    { id: 'c', name: 'calc' },
+  ]
+  const merged = mergeToolSteps(prior, next)
+  assert(
+    JSON.stringify(merged.map((s) => s.id)) === JSON.stringify(['a', 'b', 'c']),
+    `合并结果不对：${JSON.stringify(merged.map((s) => s.id))}`,
+  )
+  assert(mergeToolSteps(prior, []).length === 2, '续传这轮没调工具，也不该把已执行过的步骤抹掉')
+  assert(mergeToolSteps([], []).length === 0, '空轨迹合并应为空')
+  return 'a,b,c'
+})
+
+// ---------------------------------------------------------------- 离线：场景化模型路由
+
+suite('model-routing')
+
+const { routingCandidates, routingEnabled, complexityScore, pickModel, resolveResumeModel } =
+  modelRouter
+
+/** 路由读的是环境变量，用完必须还原，否则会串味到同进程后面的用例 */
+const LIGHT = '你好'
+const HEAVY = '请仔细分析这段代码的性能问题，并给出优化方案'
+
+function decide(question, primary = 'deepseek-chat', candidates = 'flash,pro') {
+  return withEnv(
+    { MODEL_ROUTING_CANDIDATES: candidates, MODEL_ROUTING_ENABLED: 'true' },
+    () => pickModel({ question, primary }),
+  )
+}
+
+check('没配候选或显式关闭时恒用主力模型，行为与改动前一致', async () => {
+  const unset = await withEnv({ MODEL_ROUTING_CANDIDATES: undefined }, () =>
+    pickModel({ question: HEAVY, primary: 'deepseek-chat' }),
+  )
+  assert(unset.model === 'deepseek-chat', `未配候选却换了模型：${unset.model}`)
+  assert(unset.score === 0, '路由关闭时不该给复杂度分，界面会误以为升过档')
+
+  const off = await withEnv({ MODEL_ROUTING_CANDIDATES: 'flash,pro', MODEL_ROUTING_ENABLED: 'false' }, () =>
+    pickModel({ question: HEAVY, primary: 'deepseek-chat' }),
+  )
+  assert(off.model === 'deepseek-chat', `MODEL_ROUTING_ENABLED=false 却没有回到主力模型：${off.model}`)
+  assert(routingEnabled() === false, '候选为空就该判定路由关闭')
+  return '未配置 / 显式关闭 都恒定主力档'
+})
+
+check('候选解析：逗号分隔、去空白、保持由低到高的顺序', async () => {
+  const parsed = await withEnv({ MODEL_ROUTING_CANDIDATES: ' flash , , pro ' }, () =>
+    routingCandidates(),
+  )
+  assert(
+    JSON.stringify(parsed) === JSON.stringify(['flash', 'pro']),
+    `解析结果不对：${JSON.stringify(parsed)}`,
+  )
+  return parsed.join(' → ')
+})
+
+check('分数按档位线性映射：轻问题最低档，叠满信号最高档', async () => {
+  const light = await decide(LIGHT)
+  const heavy = await decide(HEAVY)
+  assert(light.model === 'flash', `轻问题升了档：${light.model}`)
+  assert(heavy.model === 'pro', `复杂问题没升档：${heavy.model}`)
+  assert(heavy.score > light.score, `分数不单调：轻 ${light.score} ≥ 重 ${heavy.score}`)
+
+  // 三档时中间档要真的存在，否则「按场景选」退化成「只在两档间跳」
+  const mid = await decide(HEAVY, 'deepseek-chat', 'flash,pro,max')
+  assert(mid.model === 'pro', `三档时落点不对：${mid.model}`)
+  return `轻 ${light.model} / 中 ${mid.model} / 重 ${heavy.model}`
+})
+
+check('信号叠满也封顶在最高档，不会越过白名单', async () => {
+  const longest = '请仔细论证并重构这套架构，给出对比评估与表格输出：function f() {} ' + '补'.repeat(900)
+  const score = complexityScore(longest)
+  assert(score <= 1, `复杂度分越过了 1：${score}`)
+
+  const picked = await decide(longest, 'deepseek-chat', 'flash,pro')
+  assert(picked.model === 'pro', `越界后被丢掉，落到了 ${picked.model}`)
+
+  // 白名单之外还兜得住：候选只有一个时任何分数都只能落在那一档
+  const only = await decide(longest, 'deepseek-chat', 'flash')
+  assert(only.model === 'flash', `单候选却换了模型：${only.model}`)
+  return `封顶分 ${score}`
+})
+
+check('续传沿用中断那一轮的模型，即便它不是当前档位', async () => {
+  const fallback = await decide(LIGHT, 'deepseek-chat', 'flash,pro')
+  assert(fallback.model === 'flash', '前置断言不成立：轻问题本该落在第 1 档')
+
+  const kept = await withEnv({ MODEL_ROUTING_CANDIDATES: 'flash,pro' }, () =>
+    resolveResumeModel('pro', fallback),
+  )
+  assert(kept.model === 'pro', `换档位把中断那一轮的模型改掉了：${kept.model}`)
+  assert(kept.reason.includes('续传沿用'), `理由没说明是续传沿用：${kept.reason}`)
+  return kept.reason
+})
+
+check('库里没记模型、或记的已不在白名单时，退回路由器', async () => {
+  const fallback = { model: 'router-picked', reason: '路由器给的', score: 0.2 }
+  const legacy = await withEnv({ MODEL_ROUTING_CANDIDATES: 'flash,pro' }, () =>
+    resolveResumeModel(null, fallback),
+  )
+  assert(legacy.model === 'router-picked', `旧数据没记模型却凭空沿用：${legacy.model}`)
+
+  const removed = await withEnv({ MODEL_ROUTING_CANDIDATES: 'flash' }, () =>
+    resolveResumeModel('pro', fallback),
+  )
+  assert(removed.model === 'router-picked', `白名单里已经没有 pro，仍然沿用了它：${removed.model}`)
+  return '缺记录 / 已下架 都退回路由器'
 })
 
 // ---------------------------------------------------------------- 在线：工具选择命中率

@@ -173,6 +173,18 @@ export default function ChatInterface({
     return null
   }, [messages])
 
+  // 顶栏那个模型名原本恒等于配置里的主力模型，路由生效后它不再等于答案来源。
+  // 取最近一条带模型的回答，界面说的才是「刚才谁在答」。
+  const answerModel = useMemo(() => {
+    for (let index = messages.length - 1; index >= 0; index--) {
+      const message = messages[index]
+      if (message.role === 'assistant' && message.model) {
+        return { id: message.model, reason: message.modelReason }
+      }
+    }
+    return null
+  }, [messages])
+
   // 流式输出时每个 chunk 都会改变 messages，若逐次触发平滑滚动会相互打断产生抖动。
   // 这里按帧合并为一次瞬时定位，只滚动容器自身而不影响祖先滚动。
   useEffect(() => {
@@ -381,8 +393,17 @@ export default function ChatInterface({
                   hasConfig ? 'bg-emerald-500' : 'bg-amber-500'
                 }`}
               />
-              <span className="font-medium">
-                {apiConfig ? `${apiConfig.provider} · ${apiConfig.model}` : '未配置 API'}
+              <span
+                className="font-medium"
+                title={
+                  answerModel
+                    ? `刚才那条回答出自 ${answerModel.id}：${answerModel.reason ?? '服务端按场景选择'}`
+                    : '还没发起过对话，显示的是配置里的主力模型'
+                }
+              >
+                {apiConfig
+                  ? `${apiConfig.provider} · ${answerModel?.id ?? apiConfig.model}`
+                  : '未配置 API'}
               </span>
               <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
                 <circle cx="12" cy="12" r="3" />
@@ -555,6 +576,14 @@ export default function ChatInterface({
                     </div>
                     <div className="flex items-center gap-2 px-1">
                       <span className="text-xs text-slate-400">{formatTime(message.timestamp)}</span>
+                      {!isUser && message.model ? (
+                        <span
+                          className="rounded-full bg-slate-100/90 px-2 py-0.5 text-[11px] font-medium text-slate-500"
+                          title={message.modelReason ?? '本轮实际作答的模型'}
+                        >
+                          {message.model}
+                        </span>
+                      ) : null}
                       {!isUser ? (
                         <button
                           type="button"

@@ -5,6 +5,7 @@ import ChatInterface from './components/ChatInterface'
 import type { ApiConfig, Conversation, Message, ToolStep } from './types'
 import {
   UNAUTHORIZED_EVENT,
+  ChatStreamError,
   createConversation,
   deleteConversation as apiDeleteConversation,
   truncateConversation,
@@ -13,15 +14,58 @@ import {
   fetchConversations,
   fetchCurrentUser,
   fetchAuthMode,
+  isAbortError,
   logoutUser,
+  resumeChat,
   setAuthToken,
   saveConfig,
   clearConfig,
   streamChat,
 } from './client'
-import type { AuthSession, AuthUser, ConfigResponse } from './client'
+import type { AuthSession, AuthUser, ConfigResponse, ModelInfo } from './client'
 
 const BACKEND_DOWN = '无法连接到后端服务，请确认已启动 npm run dev:api'
+
+/**
+ * 断线续传次数上限与退避基数（第 n 次等 n×1.2 秒）。
+ * 3 次是权衡过的结果：再多通常意味着网络真的没了，与其让界面一直转圈，
+ * 不如把「重新生成」这个明确出口交还给用户；也不至于在 10 次/60 秒的限流下自我封锁。
+ */
+const MAX_RESUME_ATTEMPTS = 3
+const RESUME_BACKOFF_MS = 1200
+
+/** 断网时等浏览器报 online 的上限，免得几次退避全烧在还没通的网络上 */
+const ONLINE_WAIT_MS = 15000
+
+/** 可被 abort 提前结束的等待：用户点停止或离开页面时不该继续傻等 */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const finish = () => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', finish)
+      resolve()
+    }
+    const timer = setTimeout(finish, ms)
+    signal?.addEventListener('abort', finish, { once: true })
+  })
+}
+
+function waitForOnline(signal?: AbortSignal): Promise<void> {
+  if (navigator.onLine) {
+    return Promise.resolve()
+  }
+  return new Promise((resolve) => {
+    const finish = () => {
+      clearTimeout(timer)
+      window.removeEventListener('online', finish)
+      signal?.removeEventListener('abort', finish)
+      resolve()
+    }
+    const timer = setTimeout(finish, ONLINE_WAIT_MS)
+    window.addEventListener('online', finish, { once: true })
+    signal?.addEventListener('abort', finish, { once: true })
+  })
+}
 
 function App() {
   const [conversations, setConversations] = useState<Conversation[]>([])
@@ -227,95 +271,156 @@ function App() {
 
     // 局部累加，避免每个 chunk 都发 DB 请求
     const liveSteps: ToolStep[] = []
+    // 已经渲染出来的正文：既是续传要带回服务端的进度，也是重连失败后界面上留下的内容
+    let generated = ''
 
-    try {
-      await streamChat(
-        target.id,
-        content,
-        (chunk) => {
-          setConversations((prev) =>
-            prev.map((conversation) => {
-              if (conversation.id !== target.id) {
-                return conversation
-              }
-              return {
-                ...conversation,
-                messages: conversation.messages.map((message) =>
-                  message.timestamp === assistantTimestamp
-                    ? { ...message, content: message.content + chunk }
-                    : message,
-                ),
-                updatedAt: Date.now(),
-              }
-            }),
-          )
-        },
-        (step) => {
-          // calling 追加新条目；done/error 回填最近一个同名未完项
-          if (step.status === 'calling') {
-            liveSteps.push(step)
-          } else {
-            const matchIndex = step.id
-              ? liveSteps.findIndex((s) => s.id === step.id)
-              : liveSteps.findLastIndex((s) => s.name === step.name && s.result === undefined)
-            if (matchIndex >= 0) {
-              liveSteps[matchIndex] = { ...liveSteps[matchIndex], ...step }
-            } else {
-              liveSteps.push(step)
-            }
-          }
-
-          setConversations((prev) =>
-            prev.map((conversation) => {
-              if (conversation.id !== target.id) {
-                return conversation
-              }
-              return {
-                ...conversation,
-                messages: conversation.messages.map((message) =>
-                  message.timestamp === assistantTimestamp
-                    ? { ...message, steps: [...liveSteps] }
-                    : message,
-                ),
-              }
-            }),
-          )
-        },
-        (text) => {
-          // 流内非致命提示（如回答被长度上限截断）：复用顶部警告横幅，保留已生成内容
-          setErrorMessage(text)
-        },
-        controller.signal,
-      )
-      // 流结束后从 DB 重载，确保 steps 轨迹与持久化结果一致
-      const refreshed = await fetchConversation(target.id)
+    const updateAssistant = (patch: (message: Message) => Message) => {
       setConversations((prev) =>
         prev.map((conversation) =>
-          conversation.id === target.id ? refreshed : conversation,
+          conversation.id !== target.id
+            ? conversation
+            : {
+                ...conversation,
+                messages: conversation.messages.map((message) =>
+                  message.timestamp === assistantTimestamp ? patch(message) : message,
+                ),
+                updatedAt: Date.now(),
+              },
         ),
       )
-    } catch (error) {
-      if (error instanceof DOMException && error.name === 'AbortError') {
-        // User stopped, keep partial content
+    }
+
+    const appendChunk = (chunk: string) => {
+      generated += chunk
+      updateAssistant((message) => ({ ...message, content: message.content + chunk }))
+    }
+
+    const onStep = (step: ToolStep) => {
+      // calling 追加新条目；done/error 回填同 id 步骤，续传后的新步骤 id 不会与旧的相撞
+      if (step.status === 'calling') {
+        liveSteps.push(step)
       } else {
-        const msg = error instanceof Error ? error.message : '请求失败，请稍后重试。'
+        const matchIndex = step.id
+          ? liveSteps.findIndex((s) => s.id === step.id)
+          : liveSteps.findLastIndex((s) => s.name === step.name && s.result === undefined)
+        if (matchIndex >= 0) {
+          liveSteps[matchIndex] = { ...liveSteps[matchIndex], ...step }
+        } else {
+          liveSteps.push(step)
+        }
+      }
+      updateAssistant((message) => ({ ...message, steps: [...liveSteps] }))
+    }
+
+    const onNotice = (text: string) => {
+      // 流内非致命提示（如回答被长度上限截断）：复用顶部警告横幅，保留已生成内容
+      setErrorMessage(text)
+    }
+
+    /**
+     * 服务端按场景挑好的模型，写进气泡：一次会话里不同问题的档位可以不同，
+     * 「刚才是谁答的」要能对应到具体那条回答。
+     */
+    const onModel = (info: ModelInfo) => {
+      updateAssistant((message) => ({
+        ...message,
+        model: info.id,
+        modelReason: info.reason,
+      }))
+    }
+
+    /**
+     * 放弃续传。一条字都没生成才替换气泡内容；已经有半截就只挂横幅——
+     * 覆盖掉用户已经看到的文字，比报个错更让人恼火。
+     */
+    const giveUp = (error: unknown) => {
+      const msg = error instanceof Error ? error.message : '请求失败，请稍后重试。'
+      if (generated) {
+        setErrorMessage(`回答没能续写完成，已保留前面生成的内容。${msg}`)
+      } else {
         setErrorMessage(`请求失败：${msg}`)
-        setConversations((prev) =>
-          prev.map((conversation) => {
-            if (conversation.id !== target.id) {
-              return conversation
-            }
-            return {
-              ...conversation,
-              messages: conversation.messages.map((message) =>
-                message.timestamp === assistantTimestamp
-                  ? { ...message, content: `抱歉，暂时无法回答。\n\n${msg}` }
-                  : message,
-              ),
-              updatedAt: Date.now(),
-            }
-          }),
-        )
+        updateAssistant((message) => ({
+          ...message,
+          content: `抱歉，暂时无法回答。\n\n${msg}`,
+        }))
+      }
+    }
+
+    // 一条字都没有时无从「续」；后端标了不可重试的错误（密钥失效、额度不足）重试只是再烧一次额度
+    const canResume = (error: unknown) =>
+      error instanceof ChatStreamError && error.retryable && generated.length > 0
+
+    /** 回到断点接着写：每次把当前已生成文本重新交出去，服务端只回后半段增量 */
+    const resumeFromBreak = async (firstError: unknown): Promise<boolean> => {
+      let lastError = firstError
+      for (let attempt = 1; attempt <= MAX_RESUME_ATTEMPTS; attempt++) {
+        await waitForOnline(controller.signal)
+        await sleep(RESUME_BACKOFF_MS * attempt, controller.signal)
+        if (controller.signal.aborted) {
+          return false
+        }
+
+        setErrorMessage(`连接中断，正在第 ${attempt}/${MAX_RESUME_ATTEMPTS} 次自动续传…`)
+        try {
+          await resumeChat(target.id, content, generated, {
+            onChunk: appendChunk,
+            onStep,
+            onNotice,
+            onModel,
+            signal: controller.signal,
+          })
+          setErrorMessage('网络曾中断，回答已从断点续写完成。')
+          return true
+        } catch (error) {
+          // 等待或续传途中用户点了停止：半截内容照旧保留，不报错
+          if (isAbortError(error) || controller.signal.aborted) {
+            return false
+          }
+          lastError = error
+          if (!canResume(error)) {
+            giveUp(error)
+            return false
+          }
+        }
+      }
+
+      giveUp(lastError)
+      return false
+    }
+
+    try {
+      let completed = true
+      try {
+        await streamChat(target.id, content, {
+          onChunk: appendChunk,
+          onStep,
+          onNotice,
+          onModel,
+          signal: controller.signal,
+        })
+      } catch (error) {
+        if (isAbortError(error) || controller.signal.aborted) {
+          // 用户主动停止：后端已把半截回答落库，界面原样保留，这不算失败
+          completed = false
+        } else if (canResume(error)) {
+          completed = await resumeFromBreak(error)
+        } else {
+          giveUp(error)
+          completed = false
+        }
+      }
+
+      if (completed) {
+        // 流结束后从 DB 重载，确保 steps 轨迹与持久化结果一致；
+        // 重载失败不影响界面上已经看到的回答，下次进入会话会再拉一次
+        const refreshed = await fetchConversation(target.id).catch(() => null)
+        if (refreshed) {
+          setConversations((prev) =>
+            prev.map((conversation) =>
+              conversation.id === target.id ? refreshed : conversation,
+            ),
+          )
+        }
       }
     } finally {
       abortRef.current = null
