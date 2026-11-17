@@ -6,6 +6,7 @@ import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import type { Conversation, Message, ToolStep } from '../types'
 import type { ConfigResponse, AuthUser } from '../client'
+import TaskPanel from './TaskPanel'
 
 /** 等待首个 token 时的占位：空气泡只有内边距，看不出正在生成 */
 function GeneratingIndicator() {
@@ -93,6 +94,8 @@ function ToolStepsPanel({ steps }: { steps: ToolStep[] }) {
 
 interface ChatInterfaceProps {
   user: AuthUser
+  /** 免登录模式：当前身份由后端直接给出，没有会话可退出，也不该给出退出入口 */
+  demoMode?: boolean
   conversations: Conversation[]
   activeConversationId: string
   hasEmptyConversation: boolean
@@ -124,6 +127,7 @@ function formatTime(timestamp: number): string {
 
 export default function ChatInterface({
   user,
+  demoMode,
   conversations,
   activeConversationId,
   hasEmptyConversation,
@@ -386,17 +390,29 @@ export default function ChatInterface({
               </svg>
             </button>
 
+            <TaskPanel />
+
             <span
               className="hidden items-center gap-1.5 rounded-full bg-slate-100/90 px-3 py-1.5 text-xs font-medium text-slate-600 sm:inline-flex"
-              title={`当前账号：${user.username}`}
+              title={
+                demoMode
+                  ? `免登录模式，直接以后端既有数据「${user.username}」的身份使用`
+                  : `当前账号：${user.username}`
+              }
             >
               <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
                 <circle cx="12" cy="8" r="4" />
                 <path d="M4 20a8 8 0 0 1 16 0" />
               </svg>
               {user.username}
+              {demoMode ? (
+                <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700">
+                  免登录
+                </span>
+              ) : null}
             </span>
 
+            {demoMode ? null : (
             <button
               type="button"
               onClick={onLogout}
@@ -406,6 +422,7 @@ export default function ChatInterface({
             >
               退出登录
             </button>
+            )}
             </div>
           </header>
 

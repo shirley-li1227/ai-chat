@@ -4,17 +4,18 @@
 
 ```
 浏览器  React 19 + TS + Tailwind 4
-  ├─ ChatInterface / AuthView / ApiConfigModal
+  ├─ ChatInterface / AuthView / ApiConfigModal / TaskPanel
   └─ src/client.ts（统一 API 层：token、SSE 解析）
        │ HTTP / SSE（本地同源 /api/*；云端跨域，见「云端部署架构」）
        ▼
 Vite Dev Server :5173 ── proxy /api → :3001（仅本地开发）
        ▼
 NestJS Backend :3001
-  ├─ AuthModule          注册/登录、Bearer 会话守卫
+  ├─ AuthModule          注册/登录、Bearer 会话守卫、AUTH_ENABLED 免登录模式
   ├─ ConfigModule        API 配置 CRUD（加密落库）
   ├─ ConversationsModule 对话 & 消息（CASCADE）
   ├─ ChatModule          SSE 代理 + Agent 多轮循环 + 上下文裁剪/摘要
+  ├─ TasksModule         后台任务队列与 REST 接口（执行器是**另一个进程**，尚未部署）
   └─ TypeORM + sql.js → functions/api/data/app.db
        │ HTTPS + SSE（stream: true, tools）
        ▼
@@ -126,6 +127,31 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 | timestamp | bigint | 毫秒时间戳（前端排序用） |
 | conversation | FK → Conversation | 所属对话（CASCADE 删除） |
 
+### Task（后台任务）
+
+实体在 `functions/api/src/tasks/task.entity.ts`，表名 `tasks`。它是**请求侧与执行侧共用的唯一交接面**：接口只写状态，执行器只按状态领取。
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | uuid PK | 自动 |
+| userId | varchar(36), indexed | 归属账号；所有读写过 `owned(userId, id)`，越权统一 404 |
+| conversationId | varchar(36), nullable | 可选关联会话，仅用于把任务归到某段对话下，不建立外键（删会话不该顺带删掉正在跑的任务） |
+| kind | varchar(64) | 任务类型，取值来自 `task-registry.ts`；当前只有 `tool_call` |
+| status | varchar(16) | `queued` / `running` / `succeeded` / `failed` / `canceled` |
+| payload | text | 该 kind 的参数 JSON 文本，入队前按 kind 的 `resolve()` 校验过 |
+| result | text, nullable | 执行结果文本，落库前按 `TASK_RESULT_MAX_CHARS` 截断并留标记 |
+| error | text, nullable | 失败原因或「用户已取消」 |
+| progress | int | 0–100，为将来的分步任务预留；当前工具型任务只在完成时置 100 |
+| attempts | int | 已尝试次数，领取时 +1，超过 `TASK_MAX_ATTEMPTS` 判失败 |
+| dedupeKey | varchar(64), nullable | 幂等键，与 `userId` 组成**唯一索引**；同键重复提交返回既有任务 |
+| runnerId | varchar(64), nullable | 当前持有者（执行器实例标识），仅用于排查 |
+| leaseUntil | bigint, nullable | 租约到期毫秒时间戳；`running` 且它已过期 = 持有者大概死了，可被别的实例回收 |
+| notBefore | bigint, nullable | 退避门：早于此刻不可领取，避免失败后忙等重投 |
+| startedAt / finishedAt | bigint, nullable | 毫秒时间戳 |
+| createdAt / updatedAt | datetime | 列表排序依据 |
+
+> 时间字段一律用 bigint 毫秒而不是 datetime：`sqljs` 与 `postgres` 对日期列的序列化行为不同，跨驱动比较容易写错；毫秒整数两边同形，也和 `Message.timestamp` 保持一套坐标系。
+
 ## API 接口设计
 
 ### 认证
@@ -135,11 +161,17 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 | POST | `/api/auth/register` | `{ username, password }` | `{ token, user: { id, username } }`，注册成功即登录 |
 | POST | `/api/auth/login` | `{ username, password }` | 同上；用户名或密码错误统一返回 401「用户名或密码不正确」 |
 | POST | `/api/auth/logout` | — | `{ success: true }`，删除当前 token 对应的会话 |
-| GET | `/api/auth/me` | — | `{ id, username }`；无 token 时 401 |
+| GET | `/api/auth/me` | — | `{ id, username }`；无 token 时 401，免登录时直接返回演示身份 |
+| GET | `/api/auth/mode` | — | `{ authEnabled, user }`：真实登录时 `{ true, null }`，免登录时 `{ false, 演示身份 }`。前端首屏靠它决定渲染登录页还是主界面 |
 
-`register` / `login` / `health` 用 `@Public()` 放行，其余接口由全局 `AuthGuard` 解析 `Authorization: Bearer <token>`，
+`register` / `login` / `mode` / `health` 用 `@Public()` 放行，其余接口由全局 `AuthGuard` 解析 `Authorization: Bearer <token>`，
 把用户挂到 `request.user` 供控制器 `@CurrentUser()` 取用；token 缺失返回 401「请先登录」，
 不存在或已过期返回 401「登录已过期，请重新登录」。
+
+免登录（`AUTH_ENABLED` 不为 `true`）走的是守卫里的一个提前 return：解析出演示身份挂到 `request.user`、
+`request.authToken` 置空后直接放行。控制器与服务层拿到的仍是正常用户对象，不感知模式，
+因此鉴权与免登录共用同一套数据隔离代码，不存在「免登录专用分支」。
+演示身份 = 库里最早创建的账号（空库时自动建 `demo` 并认领无主的配置与会话），进程内缓存一次，避免每请求多一趟查询。
 
 守卫顺序：`ThrottlerGuard` → `AuthGuard`（先限流再查库，避免撞限流的请求白跑一次会话查询）。
 
@@ -147,7 +179,7 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 
 | Method | Path | 响应 |
 |--------|------|------|
-| GET | `/api/health` | `{ status, database: up/down, encryption: enabled/disabled, promptVersion }` |
+| GET | `/api/health` | `{ status, database: up/down, encryption: enabled/disabled, promptVersion, auth: enabled/disabled, background: enabled/disabled, tasks: { queued, running }, uptime, timestamp }`；数据库探测失败返回 503 |
 
 全局：所有接口受 `ThrottlerGuard` 按 IP 限流（`THROTTLE_TTL` / `THROTTLE_LIMIT`），仅 `NODE_ENV=production` 生效——本地开发 StrictMode 双发请求会很快撞上限流。
 
@@ -169,6 +201,22 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 | PATCH | `/api/conversations/:id` | 更新 title |
 | DELETE | `/api/conversations/:id` | 级联删除所有 messages |
 | POST | `/api/conversations/:id/truncate` | 请求体 `{ fromTimestamp }`，删除 `timestamp >= fromTimestamp` 的消息，返回 `{ removed, summaryReset }`。“重新生成”与“编辑重发”共用此入口；按时间戳而非消息 id 删除，与前端列表以 timestamp 为 key 保持同一套坐标系 |
+
+### 后台任务
+
+控制器 `functions/api/src/tasks/tasks.controller.ts`。`meta/kinds` 必须**先于 `:id` 声明**，否则 `meta/kinds` 会被当成任务 id 落到详情接口。
+
+| Method | Path | 请求 | 响应 |
+|--------|------|------|------|
+| GET | `/api/tasks/meta/kinds` | — | `{ kinds: [{ kind, description, fields: [{ name, type, required, description, enum? }] }], runnerEnabled }`；前端表单与说明直接照此渲染，新增 kind 不用改前端 |
+| GET | `/api/tasks` | query `status?`、`conversationId?` | `{ items, counts: { queued, running }, runnerEnabled }`，按 `createdAt DESC`，最多 100 条（`LIST_LIMIT`） |
+| POST | `/api/tasks` | `{ kind, payload, conversationId?, dedupeKey? }` | 任务实体；`kind` 未知、`payload` 解析不过、超过 `TASK_PAYLOAD_MAX_BYTES` 均返回 400 且消息带可用清单 |
+| GET | `/api/tasks/:id` | — | 任务实体；不存在或不属于当前账号统一 404 |
+| POST | `/api/tasks/:id/cancel` | — | 置 `canceled`、清 `leaseUntil`、`error` 缺省填「用户已取消」；已是终态返回 400 |
+
+- `dedupeKey` 幂等：命中 `(userId, dedupeKey)` 已有任务时直接返回既有那条；并发撞唯一索引也走“读回已存在”，不会造出两条
+- `payload` 的内部形状**不过全局 `ValidationPipe` 的 whitelist**（它只裁剪 DTO 自身属性），因此未知顶层属性会被 400 拒掉，而 `payload` 内的键交给 kind 的 `resolve()` 判定
+- `counts` 与 `runnerEnabled` 一起返回：界面据此区分「排队中」和「没人执行所以一直排队」。注意 `/api/tasks` 的 `counts` 是**当前账号**的水位，`/api/health` 里的是**全局**水位——前者给用户看，后者给运维看堆积
 
 ### 聊天（核心）
 
@@ -231,6 +279,37 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 - 保序：结果写入按 index 预分配的槽位，与完成先后无关，因此回填给上游的 `role: tool` 消息顺序与 `tool_calls` 一致
 - 错误隔离：worker reject 仅体现为该槽位的 `{ok:false, reason}`（`executeTool` 内部已吃掉异常，这层只为未来可能 reject 的工具兼容）
 
+### 后台任务队列（执行器待部署）
+
+长任务与 HTTP 请求的生命周期天然冲突：函数实例硬顶 300 秒、前端 `pagehide` 就会 abort，而“抓取十个页面再汇总”要跑得更久。所以这一能力拆成两半，**本次只交付不依赖常驻进程的那一半**。
+
+已交付（`functions/api/src/tasks/`）：
+
+| 部件 | 职责 |
+|------|------|
+| `task.entity.ts` | 队列的持久形状（见「Task」），状态/租约/退避/幂等字段一次配齐 |
+| `task-policy.ts` | 纯函数策略层：状态机 `canTransition`、可领取判定 `isClaimable`、退避 `backoffMs`、失败编排 `planFailure`、文本上限 `clipText`、环境变量读取 |
+| `task-registry.ts` | kind 注册表：有哪些 kind、payload 长什么样、领取后怎么解释 |
+| `task.service.ts` | 面向请求的 CRUD + 面向执行器的 `claimNext` / `renewLease` / `isCanceled` / `report` / `succeed` / `fail` |
+| `tasks.controller.ts` | REST 入口（见「后台任务」） |
+| `agent/tools.ts` 的 `run_in_background` | 让模型自己提交长任务，只回任务编号不回结果 |
+
+尚未交付：**执行器进程本身**。上面这套领取/续约/回报接口目前没有调用方，因此任务提交后会停在 `queued`。
+
+队列语义的几条硬约束：
+
+- **领取用 CAS 而不是 `SELECT … FOR UPDATE SKIP LOCKED`**：`sqljs` 驱动根本没有行锁，跨驱动写两套只会让本地与云端行为不一致。实现是「扫候选（`TASK_CLAIM_SCAN`，默认 20）→ 逐条 `UPDATE … WHERE id=? AND <资格条件>` → `affected` 为 0 就说明被别人抢走，换下一条」。冲突窗口只有一次 UPDATE 的量，对本项目这种量级足够
+- **可领取性只有 `isClaimable` 一个事实来源**：SQL 里的 `status`/`notBefore`/`leaseUntil` 条件是它的预筛，判定仍在内存里做一遍。两边各写一套是这类队列最常见的漂移点
+- **租约即存活证明**：`running` 且 `leaseUntil` 未过期表示还有实例在跑，不能被抢；过期才允许回收，否则执行器崩溃会让任务永久卡在 `running`。`renewLease` 由执行器周期性续约，续约失败（被别人接管或已取消）应当立即停手
+- **退避 + 次数上限**：失败重投按 `5s·2^(n-1)` 递增、封顶 5 分钟，超过 `TASK_MAX_ATTEMPTS`（默认 3）直接判 `failed`。没有这两条，一个稳定失败的下游会变成无限重投的燃料泵
+- **终态不可复活**：`succeeded` / `failed` / `canceled` 不再接受任何流转。用户取消后执行器才跑完，结果必须丢弃而不是把已取消的任务改回成功
+- **取消是协作式的**：接口只改状态，正在跑的执行器在回报前后用 `isCanceled()` 自查——强杀线程会让租约与副作用状态对不上
+- **幂等交给唯一索引**：`(userId, dedupeKey)` 上的唯一约束承担去重，先查后插只是省一次写；并发撞约束时读回既有任务
+
+给执行器留的部署约束（写在这里以免下次重新踩）：它必须是常驻进程，不能塞进 HTTP 函数；用 Nest 时以 `NestFactory.createApplicationContext()` 起第二个入口（不 `listen()`），单副本才可用 `@nestjs/schedule` 做轮询/cron。若日后引入 Redis，`@nestjs/bullmq` 才需要；只靠这张 `tasks` 表轮询即可满足当前规模。
+
+`BACKGROUND_TASKS_ENABLED` 控制的是**是否把这个能力广播给模型**：关掉时 `run_in_background` 不进 `tools` 列表，`/api/chat` 每轮请求都重新读取该开关（`buildToolDefinitions()` 不传参），所以切换它不需要重新构建。默认 `false`。
+
 ### 提示词版本化与回归评测
 
 SYSTEM_PROMPT / SUMMARY_PROMPT 从 service 里抽到 `chat/prompt.ts`，并导出 `PROMPT_VERSION`：
@@ -239,16 +318,28 @@ SYSTEM_PROMPT / SUMMARY_PROMPT 从 service 里抽到 `chat/prompt.ts`，并导�
 - 版本号随 `/api/health` 暴露，`evals/cases.json` 钉住同一个版本；两边不一致时评测直接失败，强制“改提示词 → 确认预期 → 升版本”这个动作不被遗漏
 - 正文含三块：工具使用准则、工具判定示例（few-shot，只示范该不该调、调哪个、参数怎么给）、输出格式规范
 
-`npm run eval`（离线，22 条用例 + 结构不变量，无需网络与 Key）覆盖：工具计算与异常、SSRF 护栏（元数据端点/回环/私网/非 http 协议）、`planWindow` 裁剪语义、并发上限与保序、`baseUrl` 归一化。`npm run eval:online` 用 `EVAL_API_KEY` 做非流式请求，断言 `expectTool` 命中率，可用 `--min-accuracy` 卡下限；在线模式缺 Key 时报错退出而不是静默通过。运行命令见 README「回归评测」。
+`npm run eval`（离线，46 项断言：19 条工具用例 + 结构与队列不变量，无需网络与 Key）覆盖：工具计算与异常、SSRF 护栏（元数据端点/回环/私网/非 http 协议）、`planWindow` 裁剪语义、并发上限与保序、`baseUrl` 归一化、工具注册表自洽（每个 spec 都有 schema 与 handler、开关只影响 `run_in_background` 的可见性、参数校验一次说清缺参/错型/多参/超长）、后台任务队列语义（终态不可复活、过期租约可回收、退避门与次数上限、kind 注册表与工具注册表口径一致、`resolve` 拒绝无人能执行的任务）、鉴权模式判定（`AUTH_ENABLED` 缺省即免登录且只认字面 `true`、与 `BACKGROUND_TASKS_ENABLED` 互不串线、兜底账号名符合 `users.username` 存储约定）。`npm run eval:online` 用 `EVAL_API_KEY` 做非流式请求，断言 `expectTool` 命中率，可用 `--min-accuracy` 卡下限；在线模式缺 Key 时报错退出而不是静默通过。运行命令见 README「回归评测」。
 
 > 评测集已经发现过两个真实缺陷：calculator 的标识符正则不含数字，`log10(1000)` 被切成 `log`+`10` 报“需要括号参数”；另一个是用例自写错（期望“星期X”，工具实际输出“周日”）—— 后者提醒断言要对着实现写，而不是对着描述文字写。
+
+### 免登录演示模式：一个开关，两条登录路径共存
+
+需求是「原有真实登录不动，加个环境变量能跳过登录，且直接用现有数据」。落地时刻意只动了一处：
+
+- **绕行的落点在守卫，不在业务**：`AuthGuard` 在 `isPublic` 之后、解析 token 之前判断 `authEnabled()`，为假就把演示身份挂上直接放行。控制器、服务层、数据隔离条件一行没改，也就不存在「免登录专用分支」日后与真实登录分支各自漂移的问题。`request.authToken` 置 null 是唯一的行为差异，而它只被 `logout` 用到。
+- **演示身份 = 最早创建的账号，而不是新账号**：这样现有 API Key 与历史对话原样可见，不用为演示复制一份数据，也不用把用户的账号改名。空库时才兜底建 `demo`，走「第一个注册账号」同样的 `claimUnowned` 认领逻辑，两条路径的语义因此一致。查询用 `find({ order: { createdAt ASC, id ASC }, take: 1 })` 而非 `findOne({})`——TypeORM 0.3 的空 `where` 会直接抛错，id 作次级排序保证并发下选中的是同一条。
+- **随机口令且不外泄**：兜底账号的密码是 32 字节随机值的 base64url，没人知道它，真实登录路径永远进不来，免登录也不依赖它。
+- **模式探测放在首屏且 fail-closed**：前端 `fetchAuthMode()` 拿不到结果就按「需要真实登录」处理。把需要鉴权的部署误判成免登录（用户看到主界面却处处 401）比多显示一次登录页严重得多。
+- **默认值是免登录，这是有意的方向性选择**：开关缺省为 `false`，发布上去不用配任何东西就能用；代价是漏配只会失效到「不鉴权」那一侧。所以线上处于哪一侧必须能不重新发布就查到——`/api/health` 的 `auth` 字段就是为此存在，README「上线验收」据此解释为什么免登录时 `/api/tasks` 不带 token 也返回 200。
+- **判定只认字面 `'true'`**：与 `BACKGROUND_TASKS_ENABLED` 同一套约定，`1`/`TRUE`/`yes` 一律不算开启，避免两种开关对同一个值给出不同答案。
 
 ## 安全设计
 
 - API Key 经 AES-256-GCM 加密后落库（密文格式见「ApiConfig」），主密钥 `ENCRYPTION_KEY` 从环境变量注入；`GET /api/config` 只返回 `apiKeyMasked`，明文仅在调用上游时存在于内存
 - 主密钥缺失或格式非法时拒绝保存，错误信息里直接给出生成命令；不会退化成明文落库。读到历史明文配置会在密钥可用时自动加密回写
 - 口令散列参数见「User」；登录接口无论用户是否存在都执行一次 scrypt（不存在时比对固定 `DUMMY_HASH`），避免用响应耗时枚举用户名
-- 业务接口全部要求 Bearer token；所有会话读写以 `userId` 为过滤条件，越权访问一律 404，不区分“不存在”和“不是你的”
+- 业务接口默认要求 Bearer token（`AUTH_ENABLED=true`）；所有会话读写以 `userId` 为过滤条件，越权访问一律 404，不区分“不存在”和“不是你的”
+- **免登录是该约定的唯一例外，且例外只写在守卫里**：`AUTH_ENABLED` 不为 `true` 时全站共用最早创建的账号身份，`/api/chat`、`/api/config` 对所有能访问域名的人开放——配额被陌生人消耗、配置被改写都在所难免，只剩按 IP 限流一层。明文 Key 仍不会外泄（`GET /api/config` 只回掩码），`/api/health` 的 `auth` 字段负责把这个状态暴露在探活里而不是埋在部署配置里。对外收紧就设 `AUTH_ENABLED=true` 重新部署，代码不用动
 - token 存 localStorage 而不是 Cookie：后端是独立的云函数域名，跨站 Cookie 需要 SameSite=None 且依赖网关配合；代价是 XSS 可读，依赖 React 转义兜底
 - 前端不直连大模型，密钥不进入浏览器
 - `fetch_url` 工具走 URL 校验（`security/url-guard.ts`）+ 超时与体积上限，防 SSRF 和超大响应；协议限制、域名黑名单、**字面量 IP 与 DNS 全量解析结果都不能落入内网**，且每跳重定向重新校验
@@ -258,22 +349,23 @@ SYSTEM_PROMPT / SUMMARY_PROMPT 从 service 里抽到 `chat/prompt.ts`，并导�
 
 | 文件 | 职责 |
 |------|------|
-| `frontend/src/client.ts` | 封装所有后端 HTTP/SSE 调用（含 `truncateConversation`）；统一管理 token（localStorage）与 `Authorization` 头，任一接口 401 时广播 `ai-chat:unauthorized` 让 App 收回登录态 |
+| `frontend/src/client.ts` | 封装所有后端 HTTP/SSE 调用（含 `truncateConversation`）；统一管理 token（localStorage）与 `Authorization` 头，任一接口 401 时广播 `ai-chat:unauthorized` 让 App 收回登录态；`fetchAuthMode` 问后端当前是否免登录，拿不到结果就按需要真实登录处理 |
 | `frontend/src/apiConfig.ts` | PROVIDER_PRESETS（给 Modal UI 渲染用）、表单校验工具 |
 | `frontend/src/types.ts` | Message / Conversation / ApiConfig / ProviderType 类型 |
-| `frontend/src/App.tsx` | 状态管理：登录态、会话列表、当前会话、配置状态；首屏用 token 换登录态，未登录只渲染 `AuthView`；登录后没配 Key 自动弹设置窗；`rewindTo` 统一承载“重新生成”与“编辑重发”（先改后端再同步本地）；`pagehide`/卸载时 abort 在途 SSE |
+| `frontend/src/App.tsx` | 状态管理：登录态、会话列表、当前会话、配置状态；首屏先问 `/api/auth/mode`，免登录时直接以返回的身份进入主界面，否则用 token 换登录态，未登录只渲染 `AuthView`；登录后没配 Key 自动弹设置窗；`rewindTo` 统一承载“重新生成”与“编辑重发”（先改后端再同步本地）；`pagehide`/卸载时 abort 在途 SSE |
 | `frontend/src/components/AuthView.tsx` | 登录/注册页：模式切换、前置长度校验、错误提示、提交中禁用按钮 |
-| `frontend/src/components/ChatInterface.tsx` | 纯 UI：侧栏 + 气泡 + 输入框 + Markdown 渲染 + 工具步骤面板；“重新生成”仅给最后一条回答，“编辑重发”仅给历史用户消息；顶栏展示当前账号与「退出登录」（生成中禁用） |
+| `frontend/src/components/ChatInterface.tsx` | 纯 UI：侧栏 + 气泡 + 输入框 + Markdown 渲染 + 工具步骤面板；“重新生成”仅给最后一条回答，“编辑重发”仅给历史用户消息；顶栏展示当前账号与「退出登录」（生成中禁用），`demoMode` 下账号旁加「免登录」标记并收起退出登录按钮——没有 token 可清，留着按钮只会给出一个点了没反应的入口 |
 | `frontend/src/components/ApiConfigModal.tsx` | 配置弹窗 UI：供应商选择 + Key/Model/BaseURL 表单 |
+| `frontend/src/components/TaskPanel.tsx` | 后台任务面板（顶栏入口 + 抽屉）：自拉数据、不向 App 要 prop；有活跃任务且抽屉打开时 2s 轮询，否则降到 15s；`runnerEnabled=false` 时明确解释「任务只会排队」；提交表单按 `/api/tasks/meta/kinds` 的字段说明渲染；取消按钮只对进行中的任务出现，终态只展示结果 |
 
 ## 扩展方向
 
-已落地（不再是待办）：多用户账号与数据隔离、CloudBase 静态托管 + HTTP 云函数部署、工具并发执行、上下文窗口裁剪 + 滚动摘要、重新生成 / 编辑重发、提示词版本化 + 回归评测。
+已落地（不再是待办）：多用户账号与数据隔离、免登录演示模式（`AUTH_ENABLED` 单开关，与真实登录共存）、CloudBase 静态托管 + HTTP 云函数部署、工具并发执行、上下文窗口裁剪 + 滚动摘要、重新生成 / 编辑重发、提示词版本化 + 回归评测、后台任务的队列表与 REST 接口。
 
 - 数据层根治：把 `DB_TYPE` 切到 `postgres`，消除多实例/冷启动导致的配置与历史丢失（当前所有“演示模式局限”的根因）
 - 对话分支：`truncateFrom` 已经是它的地基，缺的是一份“父消息/分支树”数据模型与前端切换 UI
 - 历史消息分页/虚拟滚动：现在一次 `GET :id` 拉全量；长对话需后端加分页 + 前端定高虚拟化
 - 多路并发 SSE：单路流内能做的是工具并发；“一个请求开多路回答”需先把数据层切到 postgres 并调高 `InstanceConcurrency`
-- 后台长任务：与 HTTP 请求生命周期不匹配（函数硬顶 300 秒、`pagehide` 语义恰好相反），需单独的任务队列
+- 后台长任务的**执行器**：队列、租约/退避/重试/幂等与 REST 接口都已就位，缺一个调用 `claimNext()` 的常驻进程（不能塞进 HTTP 函数）。上线后把 `BACKGROUND_TASKS_ENABLED` 置 `true`，模型才会拿到 `run_in_background`；见「后台任务队列」
 - 多供应商支持：在 `PROVIDER_PRESETS` 中新增条目，后端 ChatService 按 provider 切换请求逻辑
 - 文生图：新增 CogView / DALL-E 接口，后端添加 `/api/images/generations` 代理

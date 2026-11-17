@@ -12,6 +12,7 @@ import {
   fetchConversation,
   fetchConversations,
   fetchCurrentUser,
+  fetchAuthMode,
   logoutUser,
   setAuthToken,
   saveConfig,
@@ -31,6 +32,8 @@ function App() {
   const [hasConfig, setHasConfig] = useState(false)
   const [configModalOpen, setConfigModalOpen] = useState(false)
   const [user, setUser] = useState<AuthUser | null>(null)
+  // 免登录模式（后端 AUTH_ENABLED != true）：不渲染登录页，也不给「退出登录」入口
+  const [demoMode, setDemoMode] = useState(false)
   // 首屏要先拿 token 换登录态，其间既不该闪登录页也不该闪聊天页
   const [booting, setBooting] = useState(true)
   const abortRef = useRef<AbortController | null>(null)
@@ -76,21 +79,30 @@ function App() {
     }
   }, [loadConversations, resetWorkspace])
 
-  // 首屏用本地 token 换回登录态；换不出用户就停在登录页
+  // 首屏先确认鉴权模式：免登录时身份由后端给出；真实登录才用本地 token 换回登录态
   useEffect(() => {
     let cancelled = false
     const boot = async () => {
-      const me = await fetchCurrentUser().catch(() => null)
+      const mode = await fetchAuthMode().catch(() => null)
+      const demo = mode && !mode.authEnabled ? mode.user : null
       if (cancelled) {
         return
       }
       setBooting(false)
-      if (!me) {
-        setUser(null)
+      setDemoMode(!!demo)
+      if (demo) {
+        setUser(demo)
+        await loadWorkspace()
+        return
+      }
+      const me = await fetchCurrentUser().catch(() => null)
+      if (cancelled) {
         return
       }
       setUser(me)
-      await loadWorkspace()
+      if (me) {
+        await loadWorkspace()
+      }
     }
     boot()
     return () => {
@@ -103,6 +115,7 @@ function App() {
     const onUnauthorized = () => {
       setAuthToken(null)
       setUser(null)
+      setDemoMode(false)
       resetWorkspace()
       abortRef.current?.abort()
     }
@@ -469,6 +482,7 @@ function App() {
     <>
       <ChatInterface
         user={user}
+        demoMode={demoMode}
         conversations={conversations}
         activeConversationId={activeConversationId}
         hasEmptyConversation={hasEmptyConversation}

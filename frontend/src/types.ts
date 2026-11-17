@@ -35,3 +35,37 @@ export interface ApiConfig {
   baseUrl: string
   model: string
 }
+
+// --- 后台任务 ---
+
+export type TaskStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'canceled'
+
+export interface BackgroundTask {
+  id: string
+  kind: string
+  conversationId: string | null
+  status: TaskStatus
+  payload: Record<string, unknown>
+  result: string | null
+  error: string | null
+  progress: number
+  attempts: number
+  createdAt: number
+  updatedAt: number
+  startedAt: number | null
+  finishedAt: number | null
+}
+
+export interface TaskKindField {
+  name: string
+  type: 'string' | 'object' | 'number' | 'boolean'
+  required: boolean
+  description: string
+  enum?: string[]
+}
+
+export interface TaskKindInfo {
+  kind: string
+  description: string
+  fields: TaskKindField[]
+}

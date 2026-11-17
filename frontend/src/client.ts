@@ -1,4 +1,10 @@
-import type { ApiConfig, Conversation, ToolStep } from './types'
+import type {
+  ApiConfig,
+  BackgroundTask,
+  Conversation,
+  TaskKindInfo,
+  ToolStep,
+} from './types'
 
 // 同源部署时留空走相对路径；前后端分域时通过 VITE_API_BASE 指定绝对地址
 // 本地开发走相对 /api，由 vite.config.ts 代理到 http://localhost:3001
@@ -111,6 +117,23 @@ export async function fetchCurrentUser(): Promise<AuthUser | null> {
     return null
   }
   return (await res.json()) as AuthUser
+}
+
+export interface AuthMode {
+  authEnabled: boolean
+  user: AuthUser | null
+}
+
+/**
+ * 首屏先问后端当前是不是免登录模式：免登录时身份由后端给出，本地没有 token 也照常进入主界面。
+ * 拿不到结果就按真实登录处理——把需要鉴权的部署误判成免登录，比多显示一次登录页严重得多。
+ */
+export async function fetchAuthMode(): Promise<AuthMode> {
+  const res = await authedFetch('/auth/mode', undefined, { silentUnauthorized: true })
+  if (!res.ok) {
+    return { authEnabled: true, user: null }
+  }
+  return (await res.json()) as AuthMode
 }
 
 export async function logoutUser(): Promise<void> {
@@ -297,6 +320,108 @@ export async function truncateConversation(
     const detail = Array.isArray(raw) ? raw.join('；') : raw
     throw new Error(detail ?? '回退对话失败')
   }
+}
+
+// --- Background tasks ---
+
+interface RawTask {
+  id: string
+  kind: string
+  conversationId: string | null
+  status: BackgroundTask['status']
+  payload: string
+  result: string | null
+  error: string | null
+  progress: number
+  attempts: number
+  createdAt: string
+  updatedAt: string
+  startedAt: number | null
+  finishedAt: number | null
+}
+
+function toTask(raw: RawTask): BackgroundTask {
+  let payload: Record<string, unknown> = {}
+  try {
+    payload = JSON.parse(raw.payload) as Record<string, unknown>
+  } catch {
+    // 后端存的是自己序列化的 JSON，解析失败只影响展示，不该让整张列表消失
+  }
+  return {
+    id: raw.id,
+    kind: raw.kind,
+    conversationId: raw.conversationId,
+    status: raw.status,
+    payload,
+    result: raw.result,
+    error: raw.error,
+    progress: raw.progress,
+    attempts: raw.attempts,
+    createdAt: new Date(raw.createdAt).getTime(),
+    updatedAt: new Date(raw.updatedAt).getTime(),
+    startedAt: raw.startedAt,
+    finishedAt: raw.finishedAt,
+  }
+}
+
+async function taskError(res: Response, fallback: string): Promise<never> {
+  const data = (await res.json().catch(() => null)) as { message?: string | string[] } | null
+  throw new Error(errorMessageFrom(data) || `${fallback}（${res.status}）`)
+}
+
+/** runnerEnabled 关掉时任务只会排队，界面要能解释「为什么一直不动」 */
+export async function fetchTasks(): Promise<{
+  items: BackgroundTask[]
+  counts: { queued: number; running: number }
+  runnerEnabled: boolean
+}> {
+  const res = await authedFetch('/tasks')
+  if (!res.ok) {
+    return taskError(res, '获取后台任务失败')
+  }
+  const data = (await res.json()) as {
+    items: RawTask[]
+    counts: { queued: number; running: number }
+    runnerEnabled: boolean
+  }
+  return { items: data.items.map(toTask), counts: data.counts, runnerEnabled: data.runnerEnabled }
+}
+
+export interface TaskKindMeta {
+  kinds: TaskKindInfo[]
+  runnerEnabled: boolean
+}
+
+export async function fetchTaskKinds(): Promise<TaskKindMeta> {
+  const res = await authedFetch('/tasks/meta/kinds')
+  if (!res.ok) {
+    return taskError(res, '获取任务类型失败')
+  }
+  return (await res.json()) as TaskKindMeta
+}
+
+export async function createTask(input: {
+  kind: string
+  payload: Record<string, unknown>
+  conversationId?: string
+}): Promise<BackgroundTask> {
+  const res = await authedFetch('/tasks', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  })
+  if (!res.ok) {
+    return taskError(res, '提交后台任务失败')
+  }
+  return toTask((await res.json()) as RawTask)
+}
+
+export async function cancelTask(id: string): Promise<BackgroundTask> {
+  const res = await authedFetch(`/tasks/${id}/cancel`, { method: 'POST' })
+  if (!res.ok) {
+    return taskError(res, '取消后台任务失败')
+  }
+  return toTask((await res.json()) as RawTask)
 }
 
 // --- Chat (SSE stream) ---

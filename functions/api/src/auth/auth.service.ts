@@ -12,6 +12,7 @@ import { hashPassword, verifyPassword } from './password-hasher'
 import type { AuthUser } from './auth.decorators'
 import { ConfigService } from '../config/config.service'
 import { ConversationsService } from '../conversations/conversations.service'
+import { DEMO_USERNAME } from './auth-mode'
 
 export interface AuthResult {
   token: string
@@ -35,6 +36,9 @@ export class AuthService {
     private readonly config: ConfigService,
     private readonly conversations: ConversationsService,
   ) {}
+
+  /** 演示身份解析结果，见 demoUser() */
+  private demoUserCache: AuthUser | null = null
 
   async register(username: string, password: string): Promise<AuthResult> {
     const normalized = username.trim().toLowerCase()
@@ -75,6 +79,10 @@ export class AuthService {
   }
 
   async logout(token: string): Promise<void> {
+    // 免登录模式下请求根本不携带 token，这里没有会话可删，静默返回即可
+    if (!token) {
+      return
+    }
     await this.sessions.delete({ token })
   }
 
@@ -104,5 +112,42 @@ export class AuthService {
       }),
     )
     return { token, user: { id: user.id, username: user.username } }
+  }
+
+  /**
+   * 免登录模式下的当前用户：复用**最早创建的账号**，于是它名下的既有大模型配置与
+   * 历史会话原样可见，不需要为演示再复制一份数据。库里一个账号都没有时才兜底建号，
+   * 并顺手认领鉴权上线前的无主数据（与「首个注册账号」走同一套逻辑）。
+   *
+   * 结果在进程内缓存：排序是确定的，重复解析只会给每个请求多加一次查询。
+   */
+  async demoUser(): Promise<AuthUser> {
+    if (this.demoUserCache) {
+      return this.demoUserCache
+    }
+
+    const [earliest] = await this.users.find({
+      order: { createdAt: 'ASC', id: 'ASC' },
+      take: 1,
+    })
+    if (earliest) {
+      this.demoUserCache = { id: earliest.id, username: earliest.username }
+      return this.demoUserCache
+    }
+
+    const created = await this.users.save(
+      this.users.create({
+        username: DEMO_USERNAME,
+        // 随机口令且不外泄：真实登录路径永远进不来这个账号
+        passwordHash: await hashPassword(randomBytes(32).toString('base64url')),
+      }),
+    )
+    await Promise.all([
+      this.config.claimUnowned(created.id),
+      this.conversations.claimUnowned(created.id),
+    ])
+
+    this.demoUserCache = { id: created.id, username: created.username }
+    return this.demoUserCache
   }
 }

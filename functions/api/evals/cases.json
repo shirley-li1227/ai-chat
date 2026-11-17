@@ -1,5 +1,5 @@
 {
-  "promptVersion": "2026.11.3",
+  "promptVersion": "2026.11.4",
   "comment": "工具选择与工具行为的固定回归集。expectTool 仅在 --online 模式校验模型选择；offline 断言在无网络、无 API Key 条件下校验工具实现本身。",
   "cases": [
     {

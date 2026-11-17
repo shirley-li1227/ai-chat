@@ -1,8 +1,11 @@
 import { Injectable, BadRequestException, Logger } from '@nestjs/common'
 import { ConfigService } from '../config/config.service'
 import { ConversationsService } from '../conversations/conversations.service'
+import { TasksService } from '../tasks/task.service'
+import { TOOL_CALL_KIND } from '../tasks/task-registry'
 import { Response } from 'express'
-import { TOOL_DEFINITIONS, executeTool } from '../agent/tools'
+import { buildToolDefinitions, executeTool } from '../agent/tools'
+import type { ToolContext } from '../agent/tools'
 import type { PlainApiConfig } from '../config/config.service'
 import { runWithConcurrency } from '../agent/tool-runner'
 import { SYSTEM_PROMPT } from './prompt'
@@ -69,6 +72,7 @@ export class ChatService {
   constructor(
     private readonly configService: ConfigService,
     private readonly conversationsService: ConversationsService,
+    private readonly tasks: TasksService,
   ) {}
 
   /**
@@ -222,6 +226,19 @@ export class ChatService {
     ]
 
     const url = resolveCompletionsUrl(config.baseUrl)
+    const toolDefinitions = buildToolDefinitions()
+
+    // run_in_background 只负责入队，真正执行的是独立进程里的执行器
+    const toolContext: ToolContext = {
+      enqueueBackground: async (name, args) => {
+        const task = await this.tasks.enqueue(userId, {
+          kind: TOOL_CALL_KIND,
+          payload: { name, arguments: args },
+          conversationId,
+        })
+        return { id: task.id }
+      },
+    }
 
     const steps: StoredStep[] = []
 
@@ -253,7 +270,7 @@ export class ChatService {
             model: config.model,
             messages,
             stream: true,
-            tools: TOOL_DEFINITIONS,
+            tools: toolDefinitions,
           }),
           signal,
         })
@@ -313,7 +330,7 @@ export class ChatService {
           const outcomes = await runWithConcurrency(
             prepared,
             TOOL_CONCURRENCY,
-            ({ call, args }) => executeTool(call.function.name, args),
+            ({ call, args }) => executeTool(call.function.name, args, toolContext),
           )
 
           // 结果按 calls 原顺序回填，保证 tool 消息与 tool_calls 一一对应

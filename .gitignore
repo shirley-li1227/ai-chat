@@ -15,6 +15,8 @@ dist-ssr
 .env.local
 .env.*.local
 *.example
+# README 指向它做环境变量总清单，样例文件本身不含密钥，需要入库
+!.env.example
 # 运行时数据：SQLite 库文件含明文 API Key 与全部对话记录，禁止入库
 data/
 *.db

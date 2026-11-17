@@ -14,6 +14,8 @@ import { AuthModule } from './auth/auth.module'
 import { AuthGuard } from './auth/auth.guard'
 import { User } from './auth/user.entity'
 import { Session } from './auth/session.entity'
+import { Task } from './tasks/task.entity'
+import { TasksModule } from './tasks/tasks.module'
 
 const isProduction = process.env.NODE_ENV === 'production'
 const synchronize =
@@ -69,7 +71,7 @@ const synchronize =
             password: config.get<string>('DB_PASSWORD') ?? '',
             database: config.get<string>('DB_DATABASE') ?? 'ai_chat',
             ssl: sslEnabled ? { rejectUnauthorized: false } : false,
-            entities: [ApiConfigEntity, Conversation, Message, User, Session],
+            entities: [ApiConfigEntity, Conversation, Message, User, Session, Task],
             synchronize,
             migrationsRun: !synchronize,
           }
@@ -79,7 +81,7 @@ const synchronize =
           type: 'sqljs' as const,
           location: config.get<string>('DB_LOCATION') ?? 'data/app.db',
           autoSave: true,
-          entities: [ApiConfigEntity, Conversation, Message, User, Session],
+          entities: [ApiConfigEntity, Conversation, Message, User, Session, Task],
           synchronize,
         }
       },
@@ -87,6 +89,7 @@ const synchronize =
 
     AppConfigModule,
     ConversationsModule,
+    TasksModule,
     ChatModule,
     HealthModule,
     AuthModule,

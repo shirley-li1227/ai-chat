@@ -43,6 +43,12 @@ const results = []
 const pending = []
 let currentSuite = 'suite'
 let order = 0
+/**
+ * 断言串成一条链再跑。多个开关都从 process.env 读，而 env 是整进程共享的：
+ * 并发时一条断言临时改的值会被另一条读到（或在它 await 期间被改回去），
+ * 表现为“单独跑绿、一起跑红”的假故障。串行执行让这类干扰不可能发生。
+ */
+let chain = Promise.resolve()
 
 function suite(name) {
   currentSuite = name
@@ -55,7 +61,7 @@ function suite(name) {
  */
 function check(title, fn) {
   const record = { suite: currentSuite, title, pass: false, note: '', order: order++ }
-  pending.push(
+  chain = chain.then(() =>
     Promise.resolve()
       .then(fn)
       .then((note) => {
@@ -70,6 +76,7 @@ function check(title, fn) {
         results.push(record)
       }),
   )
+  pending.push(chain)
   return record
 }
 
@@ -118,6 +125,9 @@ let tools
 let estimator
 let runner
 let llmClient
+let taskPolicy
+let taskRegistry
+let authMode
 
 try {
   prompt = loadDist('chat/prompt.js')
@@ -125,6 +135,10 @@ try {
   estimator = loadDist('chat/token-estimator.js')
   runner = loadDist('agent/tool-runner.js')
   llmClient = loadDist('chat/llm-client.js')
+  // 队列策略与任务注册表都不依赖 Nest 容器，可以直接按纯函数断言
+  taskPolicy = loadDist('tasks/task-policy.js')
+  taskRegistry = loadDist('tasks/task-registry.js')
+  authMode = loadDist('auth/auth-mode.js')
 } catch (error) {
   console.error(`[evals] ${error.message}`)
   process.exit(1)
@@ -366,6 +380,357 @@ check('baseUrl 归一化兼容三种填法', () => {
     assert(actual === expected, `${input} -> ${actual}，期望 ${expected}`)
   }
   return `${cases.length} 种`
+})
+
+// ---------------------------------------------------------------- 离线：工具注册表
+
+suite('tool-registry')
+
+/** 断言期间要改环境变量（后台能力开关），用完必须还原，否则会污染同进程后续用例 */
+async function withEnv(overrides, fn) {
+  const saved = {}
+  for (const key of Object.keys(overrides)) {
+    saved[key] = process.env[key]
+    if (overrides[key] === undefined) delete process.env[key]
+    else process.env[key] = String(overrides[key])
+  }
+  try {
+    return await fn()
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+}
+
+check('注册表条目齐备：唯一名字、说明、参数声明、可执行 handler', () => {
+  const names = tools.TOOL_REGISTRY.map((spec) => spec.name)
+  assert(new Set(names).size === names.length, `工具名重复：${names.join(', ')}`)
+  for (const spec of tools.TOOL_REGISTRY) {
+    assert(spec.description && spec.description.length > 20, `${spec.name} 的 description 过短`)
+    assert(typeof spec.run === 'function', `${spec.name} 没有 run handler`)
+    assert(typeof spec.background === 'boolean', `${spec.name} 未显式声明 background`)
+    assert(spec.args && typeof spec.args === 'object', `${spec.name} 缺少 args 声明`)
+    for (const [key, arg] of Object.entries(spec.args)) {
+      assert(arg.description, `${spec.name}.${key} 缺少给模型看的说明`)
+      assert(
+        ['string', 'number', 'boolean', 'object'].includes(arg.type),
+        `${spec.name}.${key} 的类型 ${arg.type} 不受支持`,
+      )
+    }
+  }
+  return `${names.length} 个：${names.join(', ')}`
+})
+
+check('后台能力关闭时不广播 run_in_background，开启后才出现', () => {
+  const disabled = tools.TOOL_DEFINITIONS.map((t) => t.function.name)
+  assert(
+    !disabled.includes('run_in_background'),
+    '默认工具集里出现了 run_in_background：没有执行器时模型会提交一堆永远排队的任务',
+  )
+  const enabled = tools.buildToolDefinitions({ backgroundEnabled: true })
+  const names = enabled.map((t) => t.function.name)
+  assert(names.includes('run_in_background'), '开启后台能力后仍没有广播 run_in_background')
+  assert(
+    disabled.every((name) => names.includes(name)),
+    `开启后台能力后已有工具消失了：${disabled.filter((n) => !names.includes(n)).join(', ')}`,
+  )
+  assert(
+    names.filter((name) => !disabled.includes(name)).join(',') === 'run_in_background',
+    `开关只该影响 run_in_background，实际多出：${names.filter((n) => !disabled.includes(n)).join(', ')}`,
+  )
+  const bg = enabled.find((t) => t.function.name === 'run_in_background')
+  const enumInSchema = JSON.stringify(bg.function.parameters.properties.name.enum ?? null)
+  assert(
+    enumInSchema === JSON.stringify(tools.backgroundableToolNames()),
+    `run_in_background 的参数枚举与可后台名单不一致：${enumInSchema}`,
+  )
+  // 提示词必须提到它，否则模型即使拿到 schema 也不知道什么时候该用
+  assert(prompt.SYSTEM_PROMPT.includes('run_in_background'), '提示词未说明 run_in_background 的用法')
+  return `${disabled.length} → ${names.length}`
+})
+
+check('参数校验一次说清缺参、错型、多参与超长', () => {
+  const fetch = tools.findToolSpec('fetch_url')
+  const calc = tools.findToolSpec('calculator')
+  matchText(tools.validateToolArgs(fetch, {}), '不能为空')
+  matchText(tools.validateToolArgs(fetch, { url: 'https://a.com', extra: 1 }), '不认识的参数')
+  matchText(tools.validateToolArgs(fetch, { url: ['https://a.com'] }), '应为')
+  matchText(tools.validateToolArgs(fetch, { url: 'x'.repeat(2001) }), '超过 2000 字上限')
+  matchText(tools.validateToolArgs(fetch, 'https://a.com'), '必须是一个 JSON 对象')
+  assert(tools.validateToolArgs(calc, { expression: '1+1' }) === null, '合法参数应通过校验')
+  const runBg = tools.findToolSpec('run_in_background')
+  matchText(tools.validateToolArgs(runBg, { name: 'calculator', arguments: {} }), '只能是')
+  assert(
+    tools.validateToolArgs(runBg, { name: 'fetch_url', arguments: { url: 'https://a.com' } }) === null,
+    '合法的后台提交参数应通过校验',
+  )
+  return '7 条负例 + 2 条正例'
+})
+
+check('run_in_background：无执行器时明确拒绝，有执行器时只回任务编号', async () => {
+  // 关闭开关：连参数都不该校验到后面去，直接说明功能未启用
+  const off = await tools.executeTool('run_in_background', {
+    name: 'fetch_url',
+    arguments: { url: 'https://example.com' },
+  })
+  assert(off.ok === false, '后台能力关闭时不该成功')
+  matchText(off.output, '未启用')
+
+  await withEnv({ BACKGROUND_TASKS_ENABLED: 'true' }, async () => {
+    const noRunner = await tools.executeTool('run_in_background', {
+      name: 'fetch_url',
+      arguments: { url: 'https://example.com' },
+    })
+    assert(noRunner.ok === false, '缺少 enqueueBackground 时不该成功')
+    matchText(noRunner.output, '执行器未启用')
+
+    let submitted = null
+    const ok = await tools.executeTool(
+      'run_in_background',
+      { name: 'fetch_url', arguments: { url: 'https://example.com' } },
+      {
+        enqueueBackground: async (name, args) => {
+          submitted = { name, args }
+          return { id: 'task-abc' }
+        },
+      },
+    )
+    assert(ok.ok === true, `提交本应成功，实际：${truncate(ok.output)}`)
+    matchText(ok.output, 'task-abc')
+    // 关键：只回任务编号，模型不能据此假装已经抓到内容
+    matchText(ok.output, '本轮回答里还没有它')
+    assert(submitted.name === 'fetch_url' && submitted.args.url === 'https://example.com', '入队参数走样')
+
+    const badInner = await tools.executeTool('run_in_background', { name: 'fetch_url', arguments: {} })
+    assert(badInner.ok === false, '内层工具缺参时不该提交任务')
+    matchText(badInner.output, '参数不合法')
+  })
+  return '关闭/无执行器/成功/内层校验'
+})
+
+// ---------------------------------------------------------------- 离线：后台任务队列
+
+suite('background-task')
+
+check('状态机：终态不可再改，取消不能被迟到结果复活', () => {
+  assert(taskPolicy.canTransition('queued', 'running'), 'queued → running 应允许')
+  assert(taskPolicy.canTransition('running', 'queued'), '租约过期的 running 应能重投')
+  assert(taskPolicy.canTransition('running', 'canceled'), 'running 应可被取消')
+  for (const terminal of taskPolicy.TERMINAL_STATUSES) {
+    for (const to of taskPolicy.TASK_STATUSES) {
+      assert(
+        !taskPolicy.canTransition(terminal, to),
+        `${terminal} 是终态，不该允许流转到 ${to}`,
+      )
+    }
+    assert(taskPolicy.isTerminal(terminal), `${terminal} 应标记为终态`)
+  }
+  assert(!taskPolicy.canTransition('queued', 'succeeded'), '未执行就成功是脏数据')
+  assert(!taskPolicy.isTerminal('running'), 'running 不该是终态')
+  return `${taskPolicy.TASK_STATUSES.length} 态`
+})
+
+check('可领取判定：退避门未到、租约未过期、终态都不该被领走', () => {
+  const now = 1_700_000_000_000
+  const claimable = taskPolicy.isClaimable
+  assert(claimable({ status: 'queued', attempts: 0, leaseUntil: null, notBefore: null }, now), '排队任务应可领')
+  assert(
+    !claimable({ status: 'queued', attempts: 1, leaseUntil: null, notBefore: now + 1 }, now),
+    '退避期内的任务不该被领走，否则重试变成忙等',
+  )
+  assert(claimable({ status: 'queued', attempts: 2, leaseUntil: null, notBefore: now }, now), 'notBefore 到期即可领')
+  assert(
+    !claimable({ status: 'running', attempts: 1, leaseUntil: now + 60_000, notBefore: null }, now),
+    '租约未过期的 running 说明还有实例在跑，抢过来会跑两遍',
+  )
+  assert(claimable({ status: 'running', attempts: 1, leaseUntil: now - 1, notBefore: null }, now), '租约过期应可回收')
+  assert(
+    !claimable({ status: 'running', attempts: 1, leaseUntil: null, notBefore: null }, now),
+    'running 却没有租约时间属于异常状态，宁可不动',
+  )
+  for (const status of taskPolicy.TERMINAL_STATUSES) {
+    assert(
+      !claimable({ status, attempts: 0, leaseUntil: null, notBefore: null }, now),
+      `${status} 不该再被领取`,
+    )
+  }
+  return '7 组判定'
+})
+
+check('失败处理：未到上限重投并退避，到上限或非重试直接终态', async () => {
+  await withEnv({ TASK_MAX_ATTEMPTS: '3' }, () => {
+    assert(taskPolicy.maxAttempts() === 3, 'TASK_MAX_ATTEMPTS 没生效')
+    const now = Date.now()
+    const retry = taskPolicy.planFailure(
+      { status: 'running', attempts: 1, leaseUntil: null, notBefore: null },
+      '上游超时',
+      { retryable: true },
+    )
+    assert(retry.status === 'queued', `应重投为 queued，实际 ${retry.status}`)
+    matchText(retry.error, '第 1/3 次尝试失败')
+    assert(retry.notBefore > now, '重投必须带退避时间')
+
+    const lastAllowed = taskPolicy.planFailure(
+      { status: 'running', attempts: 2, leaseUntil: null, notBefore: null },
+      '上游超时',
+      { retryable: true },
+    )
+    assert(lastAllowed.status === 'queued', '第 2 次失败后还该有第 3 次机会')
+
+    const exhausted = taskPolicy.planFailure(
+      { status: 'running', attempts: 3, leaseUntil: null, notBefore: null },
+      '上游超时',
+      { retryable: true },
+    )
+    assert(exhausted.status === 'failed', '达到上限仍重投会无限循环')
+    assert(exhausted.notBefore === null, '终态不该带退避时间')
+
+    const fatal = taskPolicy.planFailure(
+      { status: 'running', attempts: 1, leaseUntil: null, notBefore: null },
+      '参数不合法',
+      { retryable: false },
+    )
+    assert(fatal.status === 'failed', '未声明可重试的失败应直接终态')
+    matchText(fatal.error, '参数不合法')
+  })
+})
+
+check('退避递增且封顶 5 分钟；超长文本截断留痕', () => {
+  const steps = [1, 2, 3, 4, 5, 6, 7].map((n) => taskPolicy.backoffMs(n))
+  for (let i = 1; i < steps.length; i += 1) {
+    assert(steps[i] >= steps[i - 1], `退避时间不该回退：${steps.join(', ')}`)
+  }
+  assert(Math.max(...steps) <= 300_000, `退避封顶被突破：${Math.max(...steps)}`)
+  const short = taskPolicy.clipText('短内容', 100)
+  assert(short === '短内容', '未超限不该改写')
+  const long = taskPolicy.clipText('啊'.repeat(30), 10)
+  assert(long.startsWith('啊'.repeat(10)), '截断位置不对')
+  matchText(long, '已截断')
+  matchText(long, '共 30 字')
+  return `退避至 ${Math.max(...steps)}ms`
+})
+
+check('任务类型注册表与工具注册表口径一致', () => {
+  const kind = taskRegistry.findTaskKind(taskRegistry.TOOL_CALL_KIND)
+  assert(kind, `缺少 ${taskRegistry.TOOL_CALL_KIND} 类型`)
+  assert(taskRegistry.TASK_KINDS.length > 0, 'TASK_KINDS 为空')
+  for (const spec of taskRegistry.TASK_KINDS) {
+    assert(spec.kind && spec.description, `${spec.kind} 缺少说明`)
+    assert(Array.isArray(spec.fields) && spec.fields.length > 0, `${spec.kind} 缺少字段说明`)
+    assert(typeof spec.resolve === 'function', `${spec.kind} 缺少 resolve，提交校验与执行会漂移`)
+  }
+  // 前端表单直接吃 describeTaskKinds，字段必须是可 JSON 序列化的纯数据
+  const described = JSON.parse(JSON.stringify(taskRegistry.describeTaskKinds()))
+  assert(described[0].fields[0].name === 'name', 'kind 说明字段名走样')
+  const names = kind.fields.find((f) => f.name === 'name').enum
+  assert(
+    JSON.stringify([...names].sort()) === JSON.stringify([...tools.backgroundableToolNames()].sort()),
+    `kind 的可用工具与注册表不一致：${names.join(', ')}`,
+  )
+  for (const name of names) {
+    assert(tools.findToolSpec(name)?.background, `${name} 广播可后台执行但自身未声明 background`)
+  }
+  matchText(taskRegistry.unknownKindError('nope'), 'nope')
+  return described.map((d) => d.kind).join(', ')
+})
+
+check('resolve 拒绝无人能执行的任务：坏 kind、坏 payload、坏工具、坏参数', () => {
+  const resolve = taskRegistry.resolveTaskInvocation
+  assert(resolve({ kind: 'nope', payload: {} }).ok === false, '未知 kind 不该解析成功')
+  matchText(resolve({ kind: 'nope', payload: {} }).error, '未知的任务类型')
+  matchText(resolve({ kind: 'tool_call', payload: '{坏 JSON' }).error, '不是合法 JSON')
+  matchText(resolve({ kind: 'tool_call', payload: '[1,2]' }).error, '必须是一个 JSON 对象')
+  matchText(resolve({ kind: 'tool_call', payload: { name: '', arguments: {} } }).error, 'name 不能为空')
+  matchText(resolve({ kind: 'tool_call', payload: { name: 'ghost', arguments: {} } }).error, '未注册')
+  matchText(
+    resolve({ kind: 'tool_call', payload: { name: 'calculator', arguments: { expression: '1+1' } } }).error,
+    '不适合后台执行',
+  )
+  matchText(resolve({ kind: 'tool_call', payload: { name: 'fetch_url', arguments: ['a'] } }).error, 'arguments')
+  matchText(resolve({ kind: 'tool_call', payload: { name: 'fetch_url', arguments: {} } }).error, '不能为空')
+  const ok = resolve({
+    kind: 'tool_call',
+    payload: JSON.stringify({ name: 'fetch_url', arguments: { url: 'https://example.com' } }),
+  })
+  assert(ok.ok === true, `合法任务应解析成功，实际：${truncate(ok.error ?? '')}`)
+  assert(ok.invocation.type === 'tool' && ok.invocation.name === 'fetch_url', 'invocation 形状不对')
+  assert(ok.invocation.args.url === 'https://example.com', 'args 内容丢失')
+  return '9 条负例 + 1 条正例'
+})
+
+check('队列阈值全部来自环境变量并带下限兜底', async () => {
+  await withEnv({}, () => {
+    assert(taskPolicy.leaseMs() >= 5000, '租约下限兜底失效')
+    assert(taskPolicy.maxAttempts() >= 1, '尝试次数下限兜底失效')
+    assert(taskPolicy.claimScanLimit() >= 1, '扫描条数下限兜底失效')
+    assert(taskPolicy.payloadMaxBytes() >= 256, 'payload 上限兜底失效')
+    assert(taskPolicy.resultMaxChars() >= 200, '结果上限兜底失效')
+    assert(taskPolicy.backgroundTasksEnabled() === false, '后台能力默认必须关闭：执行器还没上线')
+  })
+  await withEnv(
+    { TASK_LEASE_MS: '1', TASK_MAX_ATTEMPTS: '0', TASK_PAYLOAD_MAX_BYTES: '1', TASK_RESULT_MAX_CHARS: '1', BACKGROUND_TASKS_ENABLED: 'true' },
+    () => {
+      assert(taskPolicy.leaseMs() === 5000, '租约过小未夹紧')
+      assert(taskPolicy.maxAttempts() === 1, '尝试次数过小未夹紧')
+      assert(taskPolicy.payloadMaxBytes() === 256, 'payload 过小未夹紧')
+      assert(taskPolicy.resultMaxChars() === 200, '结果过小未夹紧')
+      assert(taskPolicy.backgroundTasksEnabled() === true, 'BACKGROUND_TASKS_ENABLED 未生效')
+    },
+  )
+  // 只认字面 'true'，TRUE/1 这类写法不该被当成开启
+  await withEnv({ BACKGROUND_TASKS_ENABLED: 'TRUE' }, () => {
+    assert(taskPolicy.backgroundTasksEnabled() === false, '开关判定应为严格等于 true')
+  })
+})
+
+// ---------------------------------------------------------------- 离线：鉴权模式开关
+
+suite('auth-mode')
+
+check('AUTH_ENABLED 缺省即免登录，且只认字面 true', async () => {
+  await withEnv({ AUTH_ENABLED: undefined }, () => {
+    assert(
+      authMode.authEnabled() === false,
+      '默认应当是免登录：本地开发不配变量就能直接看既有数据',
+    )
+  })
+  await withEnv({ AUTH_ENABLED: 'true' }, () => {
+    assert(authMode.authEnabled() === true, 'AUTH_ENABLED=true 没有打开真实登录')
+  })
+  for (const value of ['TRUE', 'True', '1', 'yes', ' false']) {
+    await withEnv({ AUTH_ENABLED: value }, () => {
+      assert(
+        authMode.authEnabled() === false,
+        `AUTH_ENABLED="${value}" 不该被当成开启（判定必须严格等于 'true'）`,
+      )
+    })
+  }
+})
+
+check('免登录开关与后台任务开关互不串线', async () => {
+  // 两个开关都是「只认字面 true」，复制粘贴时最容易读错变量名
+  await withEnv({ AUTH_ENABLED: 'true', BACKGROUND_TASKS_ENABLED: 'true' }, () => {
+    assert(authMode.authEnabled() === true, 'AUTH_ENABLED 读到了别的变量')
+    assert(taskPolicy.backgroundTasksEnabled() === true, 'BACKGROUND_TASKS_ENABLED 读到了别的变量')
+  })
+  await withEnv({ AUTH_ENABLED: 'true', BACKGROUND_TASKS_ENABLED: undefined }, () => {
+    assert(taskPolicy.backgroundTasksEnabled() === false, '后台任务开关跟着鉴权开关一起打开了')
+  })
+  await withEnv({ AUTH_ENABLED: undefined, BACKGROUND_TASKS_ENABLED: 'true' }, () => {
+    assert(authMode.authEnabled() === false, '鉴权开关跟着后台任务开关一起打开了')
+  })
+})
+
+check('兜底演示账号名符合 users.username 的存储约定', () => {
+  const name = authMode.DEMO_USERNAME
+  assert(typeof name === 'string' && name.length > 0, 'DEMO_USERNAME 为空')
+  assert(name === name.trim().toLowerCase(), `DEMO_USERNAME 必须小写无空格：${name}`)
+  // 实体列是 varchar(32)，且要留位置给可能的重名后缀
+  assert(name.length <= 32, `DEMO_USERNAME 超过 username 列长度上限：${name.length}`)
+  assert(!/[^a-z0-9_-]/.test(name), `DEMO_USERNAME 含非常规字符：${name}`)
+  return name
 })
 
 // ---------------------------------------------------------------- 在线：工具选择命中率
