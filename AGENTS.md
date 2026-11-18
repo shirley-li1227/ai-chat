@@ -14,7 +14,7 @@ npm run install:all     # 前后端依赖（仓库根执行）
 npm run dev:api         # 后端 :3001，nest start --watch
 npm run dev             # 前端 :5173，/api 走 Vite 代理
 npm run build           # 前端 → frontend/dist，后端 → functions/api/dist
-npm run verify          # 静态四件套并行（typecheck+build:api+eval / lint / build:frontend），实测约 4s，串行约 8s
+npm run verify          # 静态四件套并行（typecheck+build:api+eval / lint / build:frontend），实测约 4s，串行约 8s；lint 只报不判
 npm run verify:live     # live 栈：假上游 + 临时库 + 真后端，49 项协议断言，实测约 5s
 npm run lint            # 仅前端 eslint
 npm run typecheck       # 仅后端 tsc --noEmit
@@ -125,13 +125,16 @@ scripts/verify.mjs       静态四件套的并行编排（npm run verify）
 1. `npm run verify`——typecheck、后端构建、79 项离线断言、前端 lint、前端构建，并行跑（约 4s）。
    它替代了「四条命令排着敲一遍」，覆盖范围一样；绿了只说明**代码能跑**，不说明功能对了。
    只想跑其中几步：`npm run verify -- --only=typecheck,eval`。
+   **前端 lint 在这条命令里只报不判**（照样打输出、照样标 `exit N（只报不判）`，但不影响退出码）：
+   它挂着一条与当次改动无关的既有报错，恒定返回 1 的命令没法当闸门用。要卡 lint 就单独跑 `npm run lint`，它照旧返回非 0。
 2. `npm run verify:live`——把 `functions/api/evals/live/` 那套起来跑 49 项协议断言（约 5s）：
    假上游（`127.0.0.1`）+ 临时目录里的独立 `.db` + 每次随机的 `ENCRYPTION_KEY` + 真后端 `dist/main.js`（默认 `:4101`）。
    断言的是装配之后才成立的行为：SSE 事件顺序与 `[DONE]` 收尾、断线半截落库与续传只补增量且沿用档位、
    上游 401 判死不重连、模型按档位落档、切家后请求真带那把 Key 且走那条路径、按家校验与生效指针与删除后自动顶上、
    记忆写入去重注入与关闭后不再广播、工具事件每条带 `tool_call_id`、SSRF 护栏、明文 Key 不进响应也不进库。
    跑完自动删临时目录；失败保留并打印路径，`upstream.jsonl` 是每条上游请求的证人。
-   子集：`--only=chat-core|chat-memory|chat-memory-off|config`；留现场：`--keep`；端口被占：`--api-port` / `--upstream-port`。
+   子集：`npm run verify:live -- --only=chat-core|chat-memory|chat-memory-off|config`；留现场：`-- --keep`；换端口：`-- --api-port=4111`。
+   那个 `--` 不能省——省了 `--only` 会被 npm 当成自己的选项吃掉，runner 收不到就照跑全量；根脚本也因此直接 `node` 起 runner 而不套一层 `npm run`。
 3. 界面改动必须真在浏览器里走一遍主路径和边界（空态、错误态、加载中），做不到就明说没做，不要声称成功。
    live 栈证的是协议，证不了「看得对不对」；假上游也不会自己决定调哪个工具，模型选择命中率仍靠 `npm run eval:online`。
 

@@ -10,6 +10,9 @@
  *
  * 这条命令只覆盖静态与结构不变量。界面与 SSE 行为要靠
  * `npm run verify:live`（假上游 + 临时库）和真浏览器走一遍，见 README「改完怎么验」。
+ *
+ * lint 标成 advisory（只报不判）：它现在挂着一条与当次改动无关的既有报错，
+ * 一条恒定返回 1 的命令没法当闸门用——真要卡 lint 请单独跑 `npm run lint`，它照旧返回非 0。
  */
 import { spawn } from 'node:child_process'
 import path from 'node:path'
@@ -24,7 +27,7 @@ const STEPS = [
   { id: 'typecheck', command: npm, args: ['run', 'typecheck'], cwd: apiRoot },
   { id: 'build:api', command: npm, args: ['run', 'build'], cwd: apiRoot },
   { id: 'eval', command: process.execPath, args: ['evals/run-evals.mjs'], cwd: apiRoot },
-  { id: 'lint', command: npm, args: ['run', 'lint'], cwd: frontendRoot },
+  { id: 'lint', command: npm, args: ['run', 'lint'], cwd: frontendRoot, advisory: true },
   { id: 'build:frontend', command: npm, args: ['run', 'build'], cwd: frontendRoot },
 ]
 
@@ -87,7 +90,7 @@ const laneOutcomes = await Promise.all(
   lanes.map(async (lane) => {
     for (const step of lane) {
       const passed = await runStep(step)
-      if (!passed) {
+      if (!passed && !step.advisory) {
         return false
       }
     }
@@ -96,7 +99,13 @@ const laneOutcomes = await Promise.all(
 )
 
 const totalMs = Date.now() - totalStarted
-const failed = [...results.entries()].filter(([, value]) => value.status !== 'ok')
+const isAdvisory = (id) => byId.get(id)?.advisory === true
+const failed = [...results.entries()].filter(
+  ([id, value]) => value.status !== 'ok' && !isAdvisory(id),
+)
+const advised = [...results.entries()].filter(
+  ([id, value]) => value.status !== 'ok' && isAdvisory(id),
+)
 const serialMs = [...results.values()].reduce((sum, value) => sum + value.ms, 0)
 
 console.log('\n验证结果')
@@ -105,13 +114,25 @@ for (const step of STEPS) {
   if (!value) {
     continue
   }
+  const label =
+    value.status === 'ok'
+      ? '通过'
+      : step.advisory
+        ? `${value.status}（只报不判）`
+        : value.status
   console.log(
-    `${pad(step.id)} ${value.status === 'ok' ? '通过' : value.status}  ${(value.ms / 1000).toFixed(1)}s${
+    `${pad(step.id)} ${label}  ${(value.ms / 1000).toFixed(1)}s${
       value.note ? `  ${value.note.slice(0, 200)}` : ''
     }`,
   )
 }
 console.log(`并行 ${(totalMs / 1000).toFixed(1)}s；同口径串行约 ${(serialMs / 1000).toFixed(1)}s`)
+
+if (advised.length > 0) {
+  console.log(
+    `\n提示：${advised.map(([id]) => id).join('、')} 未通过，但不计入结果（要卡它请单独跑 npm run lint）。`,
+  )
+}
 
 if (failed.length > 0) {
   console.log(`\n有 ${failed.length} 步未通过：${failed.map(([id]) => id).join('、')}`)

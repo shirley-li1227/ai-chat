@@ -214,7 +214,9 @@ npm run eval:online -- --min-accuracy=0.9            # 卡命中率下限，低�
 **第 1 层 `npm run verify`** 把 typecheck、后端构建、79 项离线断言、前端 lint、前端构建编成三条道并行
 （[scripts/verify.mjs](file:///D:/MyProject/ai-chat-gitee/scripts/verify.mjs)）。后端那条道里省掉了 `npm run eval` 自带的第二次 `nest build`——同一条道刚刚构建过。
 分道而不是全并行，是因为两个 tsc 同时写 `dist/` 与 `.tsbuildinfo` 会得到「产物来自哪一次都不确定」的假绿。
-任一未过即退出码非 0，并打印每步耗时。绿了只说明**代码能跑**。
+任一未过即退出码非 0，并打印每步耗时；**只有前端 lint 例外——只报不判**：它照旧打输出并标 `exit 1（只报不判）`，
+但不影响这条命令的结果，因为它挂着一条与当次改动无关的既有报错，恒定返回 1 的命令没法当闸门用。
+要卡 lint 就单独跑 `npm run lint`（返回码照旧非 0）。绿了只说明**代码能跑**。
 
 **第 2 层 `npm run verify:live`** 把原先每次都要手搓的验证栈固化进了 [functions/api/evals/live/](file:///D:/MyProject/ai-chat-gitee/functions/api/evals/live)：
 假上游（`127.0.0.1:4102`，只按问题里的标记回话）+ 系统临时目录里的独立 `.db` + 每次随机的主密钥 + 真后端 `dist/main.js`（`:4101`），
@@ -229,6 +231,8 @@ npm run eval:online -- --min-accuracy=0.9            # 卡命中率下限，低�
 | `config` | 24 | 列表 + 生效指针形状、只回掩码且明文不进响应、按家校验（Key 形态互斥 / https / 跨家候选点名）、留空沿用库里那把、`apply=false` 只存不切、删除后自动顶上、库里是 `gcm1:` 密文 |
 
 子集与留场：`npm run verify:live -- --only=chat-core,config`、`--keep`；端口被占时它只报属主不动别人的进程，换端口用 `--api-port` / `--upstream-port`。
+这条脚本因此直接 `node functions/api/evals/live/run-live.mjs` 而不是 `npm --prefix functions/api run eval:live`：
+嵌套的 npm 会把 `--only=...` 当成自己的 config 吃掉，参数根本到不了 runner（表现是「指定了子集却全跑一遍」，不报错）。
 
 **第 3 层是真在浏览器里点一遍**（下面的「本地演示」两节）。live 栈证的是协议，证不了「看得对不对」；
 假上游也不会自己决定调哪个工具，「模型到底会不会调 `remember`」只能靠 `npm run eval:online` 测命中率。

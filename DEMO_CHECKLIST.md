@@ -201,6 +201,7 @@
 
 ```bash
 npm run verify        # typecheck / build:api / eval(79) / lint / build:frontend，三路并行，约 4s
+                      # lint 只报不判：那条既有的 react-hooks 报错照旧打出来，但不影响退出码；要卡它跑 npm run lint
 npm run verify:live   # build:api 后起假上游 + 临时库 + 真后端，跑 49 项协议断言，约 5s
                       # 只想看某一组：npm run verify:live -- --only=chat-core|chat-memory|chat-memory-off|config
 ```

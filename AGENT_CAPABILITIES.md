@@ -163,8 +163,8 @@
 - `long-term-memory`（7 项）：开关只认字面 `false` 且三类上限都有兜底、去重看归一化后的内容、注入按新→旧且超预算的计入 `omitted`、注入文本自带编号与三条行为约束、编号解析（完整 / 唯一前缀 / 歧义 / 不存在）、`remember`+`forget` 随开关一起广播、**记忆只进 system 段绝不混进会话历史**
 - `tool-streaming`（5 项）：三段式事件每条带 `id` 与 `name`、HTML 抽取与切分方式无关（任意分块拼起来逐字等于整篇）、抽取口径（标签与空白折叠、注释与脚本整段丢弃、实体还原）、正文到上限即停止产出且 delta 累加不超过终态 `result`、跨块多字节字符按 stream 模式解码才不变形
 - 在线评测 `npm run eval:online`（[functions/api/package.json:15](file:///D:/MyProject/ai-chat-gitee/functions/api/package.json#L15)）：只看模型选了哪个工具，按分类统计命中率
-- 装配之后的行为由 `npm run verify:live`（[functions/api/package.json:16](file:///D:/MyProject/ai-chat-gitee/functions/api/package.json#L16)）验：**49 项协议断言**，自己起假上游 + 临时库 + 真后端，覆盖 SSE 事件顺序与 `[DONE]` 收尾、断线半截落库与续传只补增量且沿用档位、上游 401 判死不重连、档位按复杂度落档、切家后请求真带那把 Key、按家校验与生效指针与删除后自动顶上、记忆的写入/去重/注入/开关、工具事件带 `tool_call_id`、SSRF 护栏、明文 Key 不进响应也不进库。它**证明不了**「模型自己会不会调工具」（假上游只按标记回话）和界面长得对不对，那两条分别归 `eval:online` 与浏览器
-- 静态四件套由 `npm run verify` 并行跑（3.8s vs 串行 8.2s），见 `TECH_DESIGN.md`「验证为什么分三层」；缺 `EVAL_API_KEY` 直接报错退出，不会静默通过
+- 装配之后的行为由 `npm run verify:live`（[package.json:18](file:///D:/MyProject/ai-chat-gitee/package.json#L18)，直接 `node` 起 [functions/api/evals/live/run-live.mjs](file:///D:/MyProject/ai-chat-gitee/functions/api/evals/live/run-live.mjs)）验：**49 项协议断言**（`chat-core` 14 / `chat-memory-off` 3 / `chat-memory` 8 / `config` 24，可用 `-- --only=` 只跑某组），自己起假上游 + 临时库 + 真后端，覆盖 SSE 事件顺序与 `[DONE]` 收尾、断线半截落库与续传只补增量且沿用档位、上游 401 判死不重连、档位按复杂度落档、切家后请求真带那把 Key、按家校验与生效指针与删除后自动顶上、记忆的写入/去重/注入/开关、工具事件带 `tool_call_id`、SSRF 护栏、明文 Key 不进响应也不进库。它**证明不了**「模型自己会不会调工具」（假上游只按标记回话）和界面长得对不对，那两条分别归 `eval:online` 与浏览器
+- 静态四件套由 `npm run verify` 并行跑（3.8s vs 串行 8.2s），见 `TECH_DESIGN.md`「验证为什么分三层」；**前端 lint 在这条命令里只报不判**（仓库里挂着一条与当次改动无关的既有 eslint 报错，恒定返回 1 的命令没法当闸门），要把 lint 当硬门就单独跑 `npm run lint`，返回码照旧；`npm run eval:online` 缺 `EVAL_API_KEY` 直接报错退出，不会静默通过
 
 用例覆盖清单与“为什么这样设计”见 `TECH_DESIGN.md`「提示词版本化与回归评测」。
 

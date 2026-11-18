@@ -15,7 +15,7 @@
     "lint": "npm --prefix frontend run lint",
     "typecheck": "npm --prefix functions/api run typecheck",
     "verify": "node scripts/verify.mjs",
-    "verify:live": "npm run build:api && npm --prefix functions/api run eval:live",
+    "verify:live": "npm run build:api && node functions/api/evals/live/run-live.mjs",
     "eval": "npm --prefix functions/api run eval",
     "eval:online": "npm --prefix functions/api run eval:online"
   }
