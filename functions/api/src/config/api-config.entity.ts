@@ -1,6 +1,8 @@
 import { Entity, Index, PrimaryGeneratedColumn, Column, CreateDateColumn, UpdateDateColumn } from 'typeorm'
 
 @Entity('api_config')
+// 一个账号在每家供应商上最多一份配置；切家只是换「哪份生效」，不是覆盖上一份的 Key
+@Index(['userId', 'provider'], { unique: true })
 export class ApiConfigEntity {
   @PrimaryGeneratedColumn('uuid')
   id: string
@@ -28,6 +30,24 @@ export class ApiConfigEntity {
 
   @Column()
   model: string
+
+  /**
+   * 该份配置是否生效。一个账号同时只有一份生效，由 ConfigService 在一个事务里
+   * 「先全置 false 再置目标为 true」保证：库里一条都没有时读路径退回最近一条，
+   * 于是改动之前的存量行不用迁移也照样能用。
+   * 不在库上加部分唯一索引：SQLite 写 `= 1`、Postgres 写 `= true`，
+   * 一条装饰器没法同时喂两种方言，为一个布尔值引入方言分支不值。
+   */
+  @Column({ type: 'boolean', default: false })
+  active: boolean
+
+  /**
+   * 该家的模型档位候选，从低到高逗号分隔。
+   * 放在配置行而不是环境变量：候选名属于供应商，`deepseek-v4-pro` 发给智谱网关只会拿 4xx，
+   * 而全局变量分不出「这几档是谁家的」。留空则退回 MODEL_ROUTING_CANDIDATES（存量部署的行为）。
+   */
+  @Column({ type: 'varchar', length: 512, nullable: true })
+  routingCandidates: string | null
 
   @CreateDateColumn()
   createdAt: Date

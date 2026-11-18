@@ -1,26 +1,34 @@
 /**
- * 场景化模型选择：在同一个供应商（DeepSeek）的几个模型之间按本轮问题挑一个。
+ * 场景化模型选择：在同一个供应商的几个模型之间按本轮问题挑一个。
  *
  * 为什么放在服务端而不是让模型自己决定：模型自选要把「换个模型再答一遍」做成一次工具调用，
  * 多一跳、双份 token、失败难归因，还会白吃掉 AGENT_MAX_TURNS 的轮数预算。而这里的判定
  * 信号（问题长度、有没有代码、是不是要推理）本来就是确定可得的，没必要交给模型猜。
  *
- * 候选集来自 MODEL_ROUTING_CANDIDATES，**按档位从低到高**逗号分隔，例如
- * `deepseek-flash,deepseek-v4-pro`：不配就等于关掉这层，行为与改动前完全一致。
- * 模型名不写死在代码里——供应商的模型 id 会换，而且用户未必开通了那一档。
+ * 候选集**按档位从低到高**逗号分隔，例如 `deepseek-flash,deepseek-v4-pro`：
+ * 空集等于关掉这层，行为与改动前完全一致。模型名不写死在代码里——供应商的模型 id 会换，
+ * 而且用户未必开通了那一档。
+ *
+ * 候选的归属：优先取该份配置里的 `api_config.routingCandidates`，留空才退回
+ * `MODEL_ROUTING_CANDIDATES`。原因是候选名属于某一家——把 `deepseek-v4-pro` 当作全局候选，
+ * 切到智谱后这一档就会发给它的网关拿 4xx，而界面只看得见「答不上来」。
  */
+import { parseCandidates } from '../config/providers'
 
-/** 档位从低到高；空数组表示路由关闭 */
-export function routingCandidates(): string[] {
-  return (process.env.MODEL_ROUTING_CANDIDATES ?? '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean)
+/** 环境变量里的全局候选（存量部署的口径，也是健康检查能看到的那一份） */
+export function envRoutingCandidates(): string[] {
+  return parseCandidates(process.env.MODEL_ROUTING_CANDIDATES)
+}
+
+/** 本轮真正生效的候选：配置里填了就用配置的，否则用环境变量 */
+export function routingCandidates(configured?: string | null): string[] {
+  const fromConfig = parseCandidates(configured)
+  return fromConfig.length > 0 ? fromConfig : envRoutingCandidates()
 }
 
 /** 关掉则恒用配置里的主力模型，用于对比测试或排障 */
-export function routingEnabled(): boolean {
-  return process.env.MODEL_ROUTING_ENABLED !== 'false' && routingCandidates().length > 0
+export function routingEnabled(candidates: string[] = envRoutingCandidates()): boolean {
+  return process.env.MODEL_ROUTING_ENABLED !== 'false' && candidates.length > 0
 }
 
 export interface RoutingInput {
@@ -28,6 +36,8 @@ export interface RoutingInput {
   question: string
   /** 配置里的主力模型：路由关闭或判定失败时用它 */
   primary: string
+  /** 本轮可用的档位候选（来自生效配置，缺省退回环境变量） */
+  candidates?: string[]
 }
 
 export interface ModelDecision {
@@ -79,9 +89,9 @@ function matchedLabels(question: string): string[] {
  *
  * 分数按档位线性映射：n 个候选就有 n-1 段，score 落在哪段用哪个。这样加第三档不用改逻辑。
  */
-export function pickModel({ question, primary }: RoutingInput): ModelDecision {
-  const candidates = routingCandidates()
-  if (!routingEnabled() || candidates.length === 0) {
+export function pickModel({ question, primary, candidates: provided }: RoutingInput): ModelDecision {
+  const candidates = provided ?? routingCandidates()
+  if (!routingEnabled(candidates) || candidates.length === 0) {
     return { model: primary, reason: '按主力模型作答（模型路由未配置）', score: 0 }
   }
 
@@ -109,8 +119,8 @@ export function pickModel({ question, primary }: RoutingInput): ModelDecision {
 export function resolveResumeModel(
   storedModel: string | null | undefined,
   fallback: ModelDecision,
+  candidates: string[] = envRoutingCandidates(),
 ): ModelDecision {
-  const candidates = routingCandidates()
   const usable = storedModel && (candidates.length === 0 || candidates.includes(storedModel))
   if (usable) {
     return {

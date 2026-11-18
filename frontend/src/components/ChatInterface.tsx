@@ -4,9 +4,10 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism'
-import type { Conversation, Message, ToolStep } from '../types'
-import type { ConfigResponse, AuthUser } from '../client'
+import type { ApiConfigView, Conversation, Message, ToolProgress, ToolStep } from '../types'
+import type { AuthUser } from '../client'
 import TaskPanel from './TaskPanel'
+import MemoryPanel from './MemoryPanel'
 
 /** 等待首个 token 时的占位：空气泡只有内边距，看不出正在生成 */
 function GeneratingIndicator() {
@@ -26,6 +27,43 @@ function GeneratingIndicator() {
   )
 }
 
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024) {
+    return `${(bytes / 1024 / 1024).toFixed(1)}MB`
+  }
+  if (bytes >= 1024) {
+    return `${Math.round(bytes / 1024)}KB`
+  }
+  return `${bytes}B`
+}
+
+/** 把量化进度压成一行小字，让「还在连」和「读到一半」在界面上区分得开 */
+function describeProgress(progress?: ToolProgress): string | null {
+  if (!progress) {
+    return null
+  }
+  const parts: string[] = []
+  if (progress.phase) {
+    parts.push(progress.phase)
+  }
+  if (progress.receivedBytes !== undefined && progress.maxBytes) {
+    parts.push(`${formatBytes(progress.receivedBytes)}/${formatBytes(progress.maxBytes)}`)
+  } else if (progress.receivedBytes !== undefined) {
+    parts.push(formatBytes(progress.receivedBytes))
+  }
+  if (progress.textChars !== undefined) {
+    parts.push(`正文 ${progress.textChars} 字`)
+  }
+  return parts.length ? parts.join(' · ') : null
+}
+
+const STEP_STATUS_TEXT: Record<ToolStep['status'], string> = {
+  calling: '执行中',
+  streaming: '执行中',
+  done: '完成',
+  error: '失败',
+}
+
 /** Agent 工具轨迹展示面板 */
 function ToolStepsPanel({ steps }: { steps: ToolStep[] }) {
   const [expanded, setExpanded] = useState(true)
@@ -33,6 +71,10 @@ function ToolStepsPanel({ steps }: { steps: ToolStep[] }) {
   if (!steps.length) {
     return null
   }
+
+  const runningCount = steps.filter(
+    (step) => step.status === 'calling' || step.status === 'streaming',
+  ).length
 
   return (
     <div className="mb-3 overflow-hidden rounded-xl border border-slate-200 bg-slate-50/80">
@@ -51,41 +93,55 @@ function ToolStepsPanel({ steps }: { steps: ToolStep[] }) {
           <path d="M9 18l6-6-6-6" />
         </svg>
         <span>调用工具 {steps.length} 次</span>
+        {runningCount > 0 ? (
+          <span className="text-amber-600">{runningCount} 个进行中</span>
+        ) : null}
       </button>
 
       {expanded ? (
         <ul className="space-y-1.5 border-t border-slate-200/70 px-3 py-2">
-          {steps.map((step, index) => (
-            <li key={step.id ?? `${step.name}-${index}`} className="text-xs">
-              <div className="flex items-center gap-2">
-                <span
-                  className={`inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-[10px] ${
-                    step.status === 'calling'
-                      ? 'bg-amber-100 text-amber-600'
-                      : step.status === 'error'
-                        ? 'bg-red-100 text-red-600'
-                        : 'bg-emerald-100 text-emerald-600'
-                  }`}
-                >
-                  {step.status === 'calling' ? '…' : step.status === 'error' ? '!' : '✓'}
-                </span>
-                <span className="font-mono font-medium text-slate-700">{step.name}</span>
-                <span className="text-slate-400">
-                  {step.status === 'calling' ? '执行中' : step.status === 'error' ? '失败' : '完成'}
-                </span>
-              </div>
+          {steps.map((step, index) => {
+            const running = step.status === 'calling' || step.status === 'streaming'
+            // 执行期间展示累加的 delta，终态换成 result：两者是同一份文本，不会跳字
+            const shown = step.result ?? step.delta ?? ''
+            const progressLine = running ? describeProgress(step.progress) : null
+            return (
+              <li key={step.id ?? `${step.name}-${index}`} className="text-xs">
+                <div className="flex items-center gap-2">
+                  <span
+                    className={`inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-[10px] ${
+                      running
+                        ? 'bg-amber-100 text-amber-600'
+                        : step.status === 'error'
+                          ? 'bg-red-100 text-red-600'
+                          : 'bg-emerald-100 text-emerald-600'
+                    }`}
+                  >
+                    {running ? '…' : step.status === 'error' ? '!' : '✓'}
+                  </span>
+                  <span className="font-mono font-medium text-slate-700">{step.name}</span>
+                  <span className="shrink-0 text-slate-400">{STEP_STATUS_TEXT[step.status]}</span>
+                  {progressLine ? (
+                    <span className="min-w-0 flex-1 truncate text-slate-400" title={progressLine}>
+                      {progressLine}
+                    </span>
+                  ) : null}
+                </div>
 
-              {Object.keys(step.args).length > 0 ? (
-                <p className="mt-0.5 truncate pl-6 font-mono text-slate-400">
-                  {JSON.stringify(step.args)}
-                </p>
-              ) : null}
+                {Object.keys(step.args ?? {}).length > 0 ? (
+                  <p className="mt-0.5 truncate pl-6 font-mono text-slate-400">
+                    {JSON.stringify(step.args)}
+                  </p>
+                ) : null}
 
-              {step.result ? (
-                <p className="mt-0.5 line-clamp-3 pl-6 text-slate-500">{step.result}</p>
-              ) : null}
-            </li>
-          ))}
+                {shown ? (
+                  <p className="mt-0.5 line-clamp-3 whitespace-pre-wrap break-words pl-6 text-slate-500">
+                    {shown}
+                  </p>
+                ) : null}
+              </li>
+            )
+          })}
         </ul>
       ) : null}
     </div>
@@ -102,8 +158,10 @@ interface ChatInterfaceProps {
   messages: Message[]
   isSending?: boolean
   errorMessage?: string | null
-  apiConfig: ConfigResponse | null
+  apiConfig: ApiConfigView | null
   hasConfig: boolean
+  /** 模型调 remember/forget 后递增，用于让记忆面板重取清单 */
+  memoryRevision?: number
   onOpenConfig: () => void
   onStop?: () => void
   onSend: (content: string) => Promise<void> | void
@@ -136,6 +194,7 @@ export default function ChatInterface({
   errorMessage = null,
   apiConfig,
   hasConfig,
+  memoryRevision = 0,
   onOpenConfig,
   onStop,
   onSend,
@@ -402,7 +461,7 @@ export default function ChatInterface({
                 }
               >
                 {apiConfig
-                  ? `${apiConfig.provider} · ${answerModel?.id ?? apiConfig.model}`
+                  ? `${apiConfig.label} · ${answerModel?.id ?? apiConfig.model}`
                   : '未配置 API'}
               </span>
               <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
@@ -412,6 +471,7 @@ export default function ChatInterface({
             </button>
 
             <TaskPanel />
+            <MemoryPanel revision={memoryRevision} />
 
             <span
               className="hidden items-center gap-1.5 rounded-full bg-slate-100/90 px-3 py-1.5 text-xs font-medium text-slate-600 sm:inline-flex"

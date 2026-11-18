@@ -16,10 +16,23 @@ import { User } from './auth/user.entity'
 import { Session } from './auth/session.entity'
 import { Task } from './tasks/task.entity'
 import { TasksModule } from './tasks/tasks.module'
+import { UserMemory } from './memory/memory.entity'
+import { MemoryModule } from './memory/memory.module'
 
 const isProduction = process.env.NODE_ENV === 'production'
 const synchronize =
   isProduction && process.env.DB_SYNCHRONIZE !== 'true' ? false : true
+
+// 实体清单只写一次：漏掉新增实体会让某一侧（本地 sqljs 或生产 Postgres）静默建不出表
+const ENTITIES = [
+  ApiConfigEntity,
+  Conversation,
+  Message,
+  User,
+  Session,
+  Task,
+  UserMemory,
+]
 
 @Module({
   imports: [
@@ -71,7 +84,7 @@ const synchronize =
             password: config.get<string>('DB_PASSWORD') ?? '',
             database: config.get<string>('DB_DATABASE') ?? 'ai_chat',
             ssl: sslEnabled ? { rejectUnauthorized: false } : false,
-            entities: [ApiConfigEntity, Conversation, Message, User, Session, Task],
+            entities: ENTITIES,
             synchronize,
             migrationsRun: !synchronize,
           }
@@ -81,7 +94,7 @@ const synchronize =
           type: 'sqljs' as const,
           location: config.get<string>('DB_LOCATION') ?? 'data/app.db',
           autoSave: true,
-          entities: [ApiConfigEntity, Conversation, Message, User, Session, Task],
+          entities: ENTITIES,
           synchronize,
         }
       },
@@ -90,6 +103,7 @@ const synchronize =
     AppConfigModule,
     ConversationsModule,
     TasksModule,
+    MemoryModule,
     ChatModule,
     HealthModule,
     AuthModule,

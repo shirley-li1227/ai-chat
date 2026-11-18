@@ -1,5 +1,7 @@
 import { assertUrlSafe } from '../security/url-guard'
 import { backgroundTasksEnabled } from '../tasks/task-policy'
+import { memoryEnabled, memoryItemMaxChars } from '../memory/memory-policy'
+import { HtmlTextStream } from './html-text'
 
 /** 工具统一返回：ok=false 时 output 是给模型看的说明，不向上抛异常 */
 export interface ToolResult {
@@ -21,6 +23,16 @@ export interface ArgSpec {
   maxLength?: number
 }
 
+/** 工具执行期间的量化进度，界面按 tool_call_id 归位显示 */
+export interface ToolProgress {
+  /** 中文阶段说明，后一次覆盖前一次 */
+  phase?: string
+  receivedBytes?: number
+  maxBytes?: number
+  /** 已抽出的正文字数，让「还在下载」和「快读完了」在界面上区分得开 */
+  textChars?: number
+}
+
 /** 执行期注入的外部能力，工具自身不依赖 Nest 容器，便于评测脚本直接调用 */
 export interface ToolContext {
   /** run_in_background 使用：把一次工具调用登记为后台任务 */
@@ -28,6 +40,15 @@ export interface ToolContext {
     name: string,
     args: Record<string, unknown>,
   ) => Promise<{ id: string }>
+  /**
+   * 边执行边推送：delta 是结果正文的增量，progress 是阶段与量化进度。
+   * 不提供时工具必须照常工作——评测脚本、后台执行器都走这条路，只有 SSE 那侧会传。
+   */
+  report?: (event: { delta?: string; progress?: ToolProgress }) => void
+  /** remember 使用：写入一条长期记忆 */
+  remember?: (content: string) => Promise<{ ok: boolean; message: string }>
+  /** forget 使用：按编号忘掉一条 */
+  forget?: (handle: string) => Promise<{ ok: boolean; message: string }>
 }
 
 export interface ToolSpec {
@@ -36,8 +57,13 @@ export interface ToolSpec {
   args: Record<string, ArgSpec>
   /** 允许被 run_in_background 提交为长任务：慢、无副作用、结果可以晚于本轮回答到达 */
   background: boolean
-  /** 条件注册：只在对应能力开启时才广播给模型 */
-  conditional?: boolean
+  /**
+   * 能力开关。返回 false 时既不广播给模型，执行也被拒绝——
+   * 没有执行器或没建表时，宁可模型压根不知道有这工具，也别造出一堆没人接的任务。
+   */
+  enabled?: () => boolean
+  /** 开关关闭时回给模型的说明，让它知道这不是它能用的能力 */
+  disabledHint?: string
   run: (args: Record<string, unknown>, ctx: ToolContext) => Promise<ToolResult>
 }
 
@@ -273,19 +299,11 @@ const FUNCTIONS: Record<string, (x: number) => number> = {
 
 const WEEKDAYS = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
 
-function htmlToText(html: string): string {
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/\s+/g, ' ')
-    .trim()
-}
+/** 交给模型和界面的正文长度上限，与工具描述里写死的数字保持一致 */
+const FETCH_TEXT_LIMIT = 3000
+
+/** 工具内部上报进度的窄接口：调用方自己决定 delta 与进度字段怎么组合 */
+type ProgressFn = (patch: { delta?: string } & ToolProgress) => void
 
 /** fetch_url 的运行策略，来自环境变量 */
 function fetchPolicy() {
@@ -301,41 +319,87 @@ function fetchPolicy() {
   }
 }
 
-/** 带体积上限地读取响应体，防止超大页面打爆内存 */
-async function readCappedText(res: Response, maxBytes: number): Promise<string> {
+/** 没挂 SSE 的调用方（后台执行器、评测脚本）拿不到 report，工具必须照常跑完 */
+function progressOf(ctx: ToolContext): ProgressFn | undefined {
+  if (!ctx.report) {
+    return undefined
+  }
+  return (patch) => {
+    const { delta, ...progress } = patch
+    ctx.report?.({ ...(delta ? { delta } : {}), progress })
+  }
+}
+
+/**
+ * 边下边抽正文。HtmlTextStream 保证任意切分下的输出与整篇解析逐字相同，
+ * 所以推送过的 delta 拼起来就是最终结果，界面不会出现二次改写。
+ */
+async function readTextStreaming(
+  res: Response,
+  policy: { maxBytes: number },
+  onProgress: ProgressFn | undefined,
+): Promise<string> {
   const reader = res.body?.getReader()
   if (!reader) {
     return ''
   }
-  const chunks: Uint8Array[] = []
+
+  const extractor = new HtmlTextStream(FETCH_TEXT_LIMIT)
+  // { stream:true } 让跨块截断的多字节字符留到下一块，否则中文会解成乱码
+  const decoder = new TextDecoder('utf-8', { fatal: false })
   let received = 0
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) break
-    if (!value) continue
-    received += value.byteLength
-    chunks.push(value)
-    if (received > maxBytes) {
-      await reader.cancel()
-      break
+  let early = false
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) {
+        break
+      }
+      if (!value) {
+        continue
+      }
+      received += value.byteLength
+      const delta = extractor.push(decoder.decode(value, { stream: true }))
+      const progress: ToolProgress = {
+        phase: extractor.full ? '正文已读满，停止下载' : '读取正文',
+        receivedBytes: received,
+        maxBytes: policy.maxBytes,
+        textChars: extractor.value.length,
+      }
+      if (delta || received > policy.maxBytes || extractor.full) {
+        onProgress?.({ ...(delta ? { delta } : {}), ...progress })
+      }
+      if (extractor.full || received > policy.maxBytes) {
+        early = true
+        break
+      }
+    }
+
+    if (!early) {
+      const tail = extractor.push(decoder.decode()) + extractor.end()
+      if (tail) {
+        onProgress?.({ delta: tail, phase: '读取完成', receivedBytes: received })
+      }
+    }
+  } finally {
+    // 提前收口要显式取消，否则连接会挂着不释放
+    if (early) {
+      await reader.cancel().catch(() => undefined)
     }
   }
-  const total = chunks.reduce((n, c) => n + c.byteLength, 0)
-  const merged = new Uint8Array(total)
-  let offset = 0
-  for (const c of chunks) {
-    merged.set(c, offset)
-    offset += c.byteLength
-  }
-  return new TextDecoder('utf-8', { fatal: false }).decode(merged)
+
+  return extractor.value
 }
 
 async function fetchUrlText(
   url: string,
+  ctx: ToolContext = {},
   policy = fetchPolicy(),
 ): Promise<ToolResult> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), policy.timeoutMs)
+  const onProgress = progressOf(ctx)
 
   try {
     let current = url
@@ -344,6 +408,7 @@ async function fetchUrlText(
     // 手动逐跳跟随重定向：每一跳都重新校验，
     // 否则可用公网域名 302 跳到内网元数据端点绕过检查
     for (let hop = 0; hop <= policy.maxRedirects; hop++) {
+      onProgress?.({ phase: `校验第 ${hop + 1} 跳地址` })
       const safe = await assertUrlSafe(current, policy.allowedHosts)
       res = await fetch(safe.url, {
         signal: controller.signal,
@@ -377,8 +442,8 @@ async function fetchUrlText(
       return fail(`不支持的内容类型：${contentType}`)
     }
 
-    const body = await readCappedText(res, policy.maxBytes)
-    const text = htmlToText(body).slice(0, 3000)
+    onProgress?.({ phase: '开始接收响应' })
+    const text = await readTextStreaming(res, policy, onProgress)
     return { ok: true, output: text || '页面无可提取文本' }
   } catch (error) {
     const message =
@@ -438,17 +503,75 @@ const fetchUrlSpec: ToolSpec = {
     },
   },
   background: true,
-  async run(args): Promise<ToolResult> {
-    return fetchUrlText(String(args.url).trim())
+  async run(args, ctx): Promise<ToolResult> {
+    return fetchUrlText(String(args.url).trim(), ctx)
   },
 }
 
-/** 可以长任务化的工具集合，供 run_in_background 的枚举与说明使用 */
-const BACKGROUNDABLE_TOOLS = [
+const rememberSpec: ToolSpec = {
+  name: 'remember',
+  description:
+    '把关于这位用户、以后其他会话也用得上的稳定事实写入长期记忆。' +
+    '应当调用：用户说「记一下 / 以后都 / 我一直 / 别忘了」，或透露出跨会话仍然成立的身份、称呼、职业、常用技术栈、长期偏好。' +
+    '不要调用：本轮的临时问题、一次性任务细节、当前对话里已经写明的内容、未经确认的猜测、随时会过期的状态。' +
+    '一次只记一条事实，用一句话陈述，不要写成对话摘录。',
+  args: {
+    content: {
+      type: 'string',
+      required: true,
+      maxLength: memoryItemMaxChars(),
+      description: `一句话陈述一个事实，不超过 ${memoryItemMaxChars()} 字，例如「用户偏好中文回复，项目用 NestJS」`,
+    },
+  },
+  background: false,
+  enabled: memoryEnabled,
+  disabledHint: '长期记忆功能未启用（MEMORY_ENABLED 为 false）',
+  async run(args, ctx): Promise<ToolResult> {
+    if (!ctx.remember) {
+      return fail('长期记忆服务不可用，请确认后端已建 user_memories 表')
+    }
+    const result = await ctx.remember(String(args.content))
+    return { ok: result.ok, output: result.message }
+  },
+}
+
+const forgetSpec: ToolSpec = {
+  name: 'forget',
+  description:
+    '按编号忘掉一条长期记忆。当用户说「那条记错了 / 别再记着这个 / 删掉那条」，' +
+    '或发现已有记忆与用户此刻的明确说法冲突时调用。' +
+    '编号就是记忆清单里每行方括号中的 8 位字符；不确定该删哪条时先问用户，不要凭猜测删除。',
+  args: {
+    handle: {
+      type: 'string',
+      required: true,
+      maxLength: 40,
+      description: '记忆编号，例如 "3f9a1c22"，也接受完整 UUID',
+    },
+  },
+  background: false,
+  enabled: memoryEnabled,
+  disabledHint: '长期记忆功能未启用（MEMORY_ENABLED 为 false）',
+  async run(args, ctx): Promise<ToolResult> {
+    if (!ctx.forget) {
+      return fail('长期记忆服务不可用，请确认后端已建 user_memories 表')
+    }
+    const result = await ctx.forget(String(args.handle))
+    return { ok: result.ok, output: result.message }
+  },
+}
+
+/** 不依赖后台能力的普通工具，注册表与可长任务化集合都从这里派生，避免另维护一份名单 */
+const PLAIN_SPECS: ToolSpec[] = [
   getCurrentTimeSpec,
   calculatorSpec,
   fetchUrlSpec,
-].filter((spec) => spec.background)
+  rememberSpec,
+  forgetSpec,
+]
+
+/** 可以长任务化的工具集合，供 run_in_background 的枚举与说明使用 */
+const BACKGROUNDABLE_TOOLS = PLAIN_SPECS.filter((spec) => spec.background)
 
 const BACKGROUNDABLE_NAMES = BACKGROUNDABLE_TOOLS.map((spec) => spec.name)
 
@@ -472,7 +595,8 @@ const runInBackgroundSpec: ToolSpec = {
     },
   },
   background: false,
-  conditional: true,
+  enabled: backgroundTasksEnabled,
+  disabledHint: '后台任务功能未启用（BACKGROUND_TASKS_ENABLED 不为 true）',
   async run(args, ctx): Promise<ToolResult> {
     const name = String(args.name).trim()
     const spec = BACKGROUNDABLE_TOOLS.find((candidate) => candidate.name === name)
@@ -501,34 +625,32 @@ const runInBackgroundSpec: ToolSpec = {
 }
 
 /** 全部工具规格，注册表是唯一事实来源：schema、校验、分发都从这里派生 */
-export const TOOL_REGISTRY: ToolSpec[] = [
-  getCurrentTimeSpec,
-  calculatorSpec,
-  fetchUrlSpec,
-  runInBackgroundSpec,
-]
+export const TOOL_REGISTRY: ToolSpec[] = [...PLAIN_SPECS, runInBackgroundSpec]
 
 export function findToolSpec(name: string): ToolSpec | undefined {
   return TOOL_REGISTRY.find((spec) => spec.name === name)
 }
 
-/**
- * 本轮请求要广播的工具清单。
- * @param options.backgroundEnabled 省略时读取环境变量，关掉就不提交无人执行的任务
- */
-export function buildToolDefinitions(
-  options: { backgroundEnabled?: boolean } = {},
-): ToolDefinition[] {
-  const backgroundEnabled = options.backgroundEnabled ?? backgroundTasksEnabled()
-  return TOOL_REGISTRY.filter(
-    (spec) => !spec.conditional || backgroundEnabled,
-  ).map(toDefinition)
+/** 开关关闭时回给模型的说明；未设开关的工具恒为 null */
+export function disabledHintOf(spec: ToolSpec): string | null {
+  if (!spec.enabled || spec.enabled()) {
+    return null
+  }
+  return spec.disabledHint ?? `工具 ${spec.name} 当前未启用`
 }
 
-/** 默认可见工具集（不含条件注册项），供不关心后台能力的调用方与评测使用 */
-export const TOOL_DEFINITIONS: ToolDefinition[] = buildToolDefinitions({
-  backgroundEnabled: false,
-})
+/**
+ * 本轮请求要广播的工具清单。每轮重新求值开关，
+ * 改环境变量重启即生效，不必重新构建。
+ */
+export function buildToolDefinitions(): ToolDefinition[] {
+  return TOOL_REGISTRY.filter((spec) => !disabledHintOf(spec)).map(toDefinition)
+}
+
+/** 不受任何开关影响的常驻工具集，供评测与「关掉全部条件能力」的调用方使用 */
+export const TOOL_DEFINITIONS: ToolDefinition[] = TOOL_REGISTRY.filter(
+  (spec) => !spec.enabled,
+).map(toDefinition)
 
 /** 可以提交为后台任务的工具名 */
 export function backgroundableToolNames(): string[] {
@@ -544,8 +666,9 @@ export async function executeTool(
   if (!spec) {
     return fail(`未知工具：${name}`)
   }
-  if (spec.conditional && !backgroundTasksEnabled()) {
-    return fail('后台任务功能未启用（BACKGROUND_TASKS_ENABLED 不为 true）')
+  const disabled = disabledHintOf(spec)
+  if (disabled) {
+    return fail(disabled)
   }
 
   const problem = validateToolArgs(spec, args)

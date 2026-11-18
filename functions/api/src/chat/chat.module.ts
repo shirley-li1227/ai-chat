@@ -4,9 +4,10 @@ import { ChatController } from './chat.controller'
 import { ConfigModule } from '../config/config.module'
 import { ConversationsModule } from '../conversations/conversations.module'
 import { TasksModule } from '../tasks/tasks.module'
+import { MemoryModule } from '../memory/memory.module'
 
 @Module({
-  imports: [ConfigModule, ConversationsModule, TasksModule],
+  imports: [ConfigModule, ConversationsModule, TasksModule, MemoryModule],
   controllers: [ChatController],
   providers: [ChatService],
 })

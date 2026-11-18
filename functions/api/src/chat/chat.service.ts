@@ -5,10 +5,17 @@ import { TasksService } from '../tasks/task.service'
 import { TOOL_CALL_KIND } from '../tasks/task-registry'
 import { Response } from 'express'
 import { buildToolDefinitions, executeTool } from '../agent/tools'
-import type { ToolContext } from '../agent/tools'
+import type { ToolContext, ToolResult } from '../agent/tools'
 import type { PlainApiConfig } from '../config/config.service'
+import { MemoryService } from '../memory/memory.service'
 import { runWithConcurrency } from '../agent/tool-runner'
-import { SYSTEM_PROMPT } from './prompt'
+import { buildRequestMessages } from './request-context'
+import {
+  toolCallingEvent,
+  toolResultEvent,
+  toolStreamingEvent,
+} from './sse-events'
+import type { ToolStreamPatch } from './sse-events'
 import { resolveCompletionsUrl } from './llm-client'
 import { buildRollingSummary } from './context-summarizer'
 import { estimateTokens, planWindow } from './token-estimator'
@@ -18,7 +25,7 @@ import {
   retryableForStatus,
   ResumeRejectedError,
 } from './continuation'
-import { pickModel, resolveResumeModel } from './model-router'
+import { pickModel, resolveResumeModel, routingCandidates } from './model-router'
 import type { ModelDecision } from './model-router'
 import type { OutboundMessage } from './continuation'
 
@@ -75,6 +82,7 @@ export class ChatService {
     private readonly configService: ConfigService,
     private readonly conversationsService: ConversationsService,
     private readonly tasks: TasksService,
+    private readonly memories: MemoryService,
   ) {}
 
   /**
@@ -189,31 +197,8 @@ export class ChatService {
     return config
   }
 
-  /**
-   * 系统提示与滚动摘要只在请求层注入，不进会话历史，所以每次组装都要重新拼一遍。
-   */
-  private assembleMessages(
-    historyMessages: OutboundMessage[],
-    summary: string | null,
-  ): OutboundMessage[] {
-    return [
-      { role: 'system', content: SYSTEM_PROMPT },
-      ...(summary
-        ? [
-            {
-              role: 'system',
-              content:
-                '以下是本对话更早内容的摘要，请当作已知事实使用，不要向用户复述摘要本身：\n' +
-                summary,
-            },
-          ]
-        : []),
-      ...historyMessages,
-    ]
-  }
-
   /** run_in_background 只负责入队，真正执行的是独立进程里的执行器 */
-  private backgroundToolContext(userId: string, conversationId: string): ToolContext {
+  private toolContextFor(userId: string, conversationId: string): ToolContext {
     return {
       enqueueBackground: async (name, args) => {
         const task = await this.tasks.enqueue(userId, {
@@ -223,7 +208,33 @@ export class ChatService {
         })
         return { id: task.id }
       },
+      // remember / forget 走服务层而不是直连上游：条数上限、去重、编号歧义
+      // 这些规则界面手动操作时也要遵守，两处共用一份才不会对不上
+      remember: async (content) => {
+        const result = await this.memories.remember(userId, content, 'model', conversationId)
+        return { ok: result.ok, message: result.message }
+      },
+      forget: async (handle) => {
+        const result = await this.memories.forget(userId, handle)
+        return { ok: result.ok, message: result.message }
+      },
     }
+  }
+
+  /**
+   * 本轮请求的上下文 = 常驻 system + 长期记忆 + 会话摘要 + 历史。
+   * 记忆读失败按「没有记忆」处理，不能让锦上添花的功能钉住一次对话。
+   */
+  private async requestMessages(
+    history: OutboundMessage[],
+    summary: string | null,
+    userId: string,
+  ): Promise<OutboundMessage[]> {
+    return buildRequestMessages({
+      history,
+      summary,
+      memory: await this.memories.renderForPrompt(userId),
+    })
   }
 
   async streamChat(
@@ -255,12 +266,16 @@ export class ChatService {
     )
 
     // 决策只算一次：请求体里用的和落库、下发给界面的必须是同一个模型
-    const decision = pickModel({ question: content, primary: config.model })
+    const decision = pickModel({
+      question: content,
+      primary: config.model,
+      candidates: routingCandidates(config.routingCandidates),
+    })
 
     await this.runTurn(
       config,
-      this.assembleMessages(historyMessages, summary),
-      this.backgroundToolContext(userId, conversationId),
+      await this.requestMessages(historyMessages, summary, userId),
+      this.toolContextFor(userId, conversationId),
       res,
       signal,
       decision,
@@ -333,15 +348,17 @@ export class ChatService {
 
     // 续传必须接着中断那一轮用同一个模型：换模型续写会让前后半段风格断裂，
     // 而浏览器手上只有文本，看不出问题出在模型换了
+    const candidates = routingCandidates(config.routingCandidates)
     const decision = resolveResumeModel(
       dropped.model,
-      pickModel({ question: content, primary: config.model }),
+      pickModel({ question: content, primary: config.model, candidates }),
+      candidates,
     )
 
     await this.runTurn(
       config,
-      this.assembleMessages(continuation, summary),
-      this.backgroundToolContext(userId, conversationId),
+      await this.requestMessages(continuation, summary, userId),
+      this.toolContextFor(userId, conversationId),
       res,
       signal,
       decision,
@@ -479,46 +496,63 @@ export class ChatService {
                 result: '',
                 ok: false,
               })
-              sendEvent({
-                tool: { id: call.id, name: call.function.name, args, status: 'calling' },
-              })
+              sendEvent(toolCallingEvent(call.id, call.function.name, args))
             }
 
             return { call, args }
           })
 
-          // executeTool 内部已吃掉异常，这里的失败分支只为未来可能 reject 的工具兼容
+          // 终态在单个工具执行完的那一刻就推送，不等整批并发跑完：
+          // 同一批里 calculator 毫秒级、fetch_url 可能十几秒，等齐了再更新
+          // 会让先完成的工具一直显示「执行中」，慢的那个反而什么都看不见
+          const finishStep = (
+            call: ToolCall,
+            args: Record<string, unknown>,
+            value: ToolResult,
+          ): ToolResult => {
+            const recorded = steps.find((s) => s.id === call.id)
+            if (recorded) {
+              recorded.result = value.output
+              recorded.ok = value.ok
+            }
+            sendEvent(
+              toolResultEvent(call.id, call.function.name, args, value.ok, value.output),
+            )
+            return value
+          }
+
+          // executeTool 内部已吃掉异常，这里的 catch 只为未来可能 reject 的工具兼容
           const outcomes = await runWithConcurrency(
             prepared,
             TOOL_CONCURRENCY,
-            ({ call, args }) => executeTool(call.function.name, args, toolContext),
+            async ({ call, args }): Promise<ToolResult> => {
+              const report = (patch: ToolStreamPatch) => {
+                sendEvent(toolStreamingEvent(call.id, call.function.name, patch))
+              }
+              try {
+                return finishStep(
+                  call,
+                  args,
+                  await executeTool(call.function.name, args, { ...toolContext, report }),
+                )
+              } catch (error) {
+                return finishStep(call, args, {
+                  ok: false,
+                  output: `工具执行异常：${(error as Error)?.message ?? String(error)}`,
+                })
+              }
+            },
           )
 
-          // 结果按 calls 原顺序回填，保证 tool 消息与 tool_calls 一一对应
+          // tool 消息必须与 tool_calls 原序一一对应，顺序错了上游直接报错，
+          // 所以这里只按提交顺序回填 messages，事件已经在各工具完成时发过了
           for (let i = 0; i < prepared.length; i++) {
-            const { call, args } = prepared[i]
+            const { call } = prepared[i]
             const outcome = outcomes[i]
-            const ok = outcome.ok === true ? outcome.value.ok : false
             const output =
               outcome.ok === true
                 ? outcome.value.output
                 : `工具执行异常：${(outcome.reason as Error)?.message ?? String(outcome.reason)}`
-
-            const recorded = steps.find((s) => s.id === call.id)
-            if (recorded) {
-              recorded.result = output
-              recorded.ok = ok
-            }
-
-            sendEvent({
-              tool: {
-                id: call.id,
-                name: call.function.name,
-                args,
-                status: ok ? 'done' : 'error',
-                result: output,
-              },
-            })
 
             messages.push({
               role: 'tool',

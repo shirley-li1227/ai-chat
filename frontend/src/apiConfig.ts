@@ -10,6 +10,10 @@ export interface ProviderPreset {
   modelPlaceholder: string
   modelHint: string
   apiKeyPlaceholder: string
+  /** 界面提示用的 Key 形态说明，真正的格式校验只在后端 PROVIDER_REGISTRY 里做一份 */
+  apiKeyHint: string
+  /** 模型档位候选的示例，从低到高逗号分隔 */
+  routingCandidatesHint: string
   docsUrl: string
 }
 
@@ -22,13 +26,41 @@ export const PROVIDER_PRESETS: Record<ProviderType, ProviderPreset> = {
     defaultModel: 'deepseek-chat',
     modelLabel: '模型名称',
     modelPlaceholder: 'deepseek-chat / deepseek-reasoner',
-    modelHint: '常用取值：deepseek-chat、deepseek-reasoner。',
+    modelHint: '常用取值：deepseek-flash、deepseek-v4-pro、deepseek-reasoner。',
     apiKeyPlaceholder: 'sk-...',
+    apiKeyHint: 'DeepSeek 密钥以 sk- 开头。',
+    routingCandidatesHint: '例如 deepseek-flash,deepseek-v4-pro（从低到高）',
     docsUrl: 'https://api-docs.deepseek.com/zh-cn/',
+  },
+  zhipu: {
+    type: 'zhipu',
+    label: '智谱 GLM',
+    description: '智谱开放平台的 OpenAI 兼容端点，baseUrl 需带上 /api/paas/v4 路径。',
+    defaultBaseUrl: 'https://open.bigmodel.cn/api/paas/v4',
+    defaultModel: 'glm-5.3',
+    modelLabel: '模型名称',
+    modelPlaceholder: 'glm-5.3 / glm-5.3-flash',
+    modelHint: '常用取值：glm-5.3、glm-5.3-flash；带 -air 的档位更省。',
+    apiKeyPlaceholder: 'id.secret',
+    apiKeyHint: '智谱密钥形如「id.secret」，以点号分成两段。',
+    routingCandidatesHint: '例如 glm-5.3-air,glm-5.3-flash,glm-5.3（从低到高）',
+    docsUrl: 'https://docs.bigmodel.cn/cn/guide/develop/openai/introduction',
   },
 }
 
-export const PROVIDER_ORDER: ProviderType[] = ['deepseek']
+export const PROVIDER_ORDER: ProviderType[] = ['deepseek', 'zhipu']
+
+/**
+ * localStorage 与后端响应里的 provider 都是外部字符串，
+ * 用类型断言硬转会让未知取值一路混进 UI（拿到 undefined preset 直接白屏）。
+ */
+export function isProviderType(value: unknown): value is ProviderType {
+  return typeof value === 'string' && Object.hasOwn(PROVIDER_PRESETS, value)
+}
+
+export function providerLabel(provider: ProviderType): string {
+  return PROVIDER_PRESETS[provider].label
+}
 
 export function createDefaultConfig(provider: ProviderType): ApiConfig {
   const preset = PROVIDER_PRESETS[provider]
@@ -40,15 +72,14 @@ export function createDefaultConfig(provider: ProviderType): ApiConfig {
   }
 }
 
-export function isValidConfig(config: ApiConfig): boolean {
-  return (
-    typeof config.apiKey === 'string' &&
-    config.apiKey.trim().length > 0 &&
-    typeof config.baseUrl === 'string' &&
-    /^https?:\/\//i.test(config.baseUrl.trim()) &&
-    typeof config.model === 'string' &&
-    config.model.trim().length > 0
-  )
+/**
+ * 与后端 PROVIDER_REGISTRY 的 baseUrl 规则同一口径：只收 https，允许带路径
+ * （智谱的兼容端点是 https://open.bigmodel.cn/api/paas/v4）。
+ */
+const HTTPS_BASE_URL = /^https:\/\/[A-Za-z0-9.-]+(?::\d+)?(\/[A-Za-z0-9._~%\-/!]*)?$/
+
+export function isHttpsBaseUrl(baseUrl: string): boolean {
+  return HTTPS_BASE_URL.test(baseUrl.trim())
 }
 
 export function buildChatCompletionsUrl(baseUrl: string): string {
@@ -57,11 +88,4 @@ export function buildChatCompletionsUrl(baseUrl: string): string {
     return trimmed
   }
   return `${trimmed}/chat/completions`
-}
-
-export function maskApiKey(apiKey: string): string {
-  if (apiKey.length <= 8) {
-    return '\u2022'.repeat(apiKey.length)
-  }
-  return `${apiKey.slice(0, 4)}****${apiKey.slice(-4)}`
 }

@@ -1,5 +1,5 @@
 {
-  "promptVersion": "2026.11.4",
+  "promptVersion": "2026.11.5",
   "comment": "工具选择与工具行为的固定回归集。expectTool 仅在 --online 模式校验模型选择；offline 断言在无网络、无 API Key 条件下校验工具实现本身。",
   "cases": [
     {
@@ -171,6 +171,29 @@
       "id": "none-04",
       "category": "no-tool",
       "input": "随便聊聊，你觉得远程办公怎么样",
+      "expectTool": null,
+      "offline": { "kind": "none" }
+    },
+    {
+      "id": "mem-01",
+      "category": "memory",
+      "input": "记一下：我以后所有回答都要用中文，我目前在做 NestJS 项目",
+      "expectTool": "remember",
+      "toolArgs": { "content": "偏好中文回复；当前在做 NestJS 项目" },
+      "offline": { "kind": "error", "expectIncludes": "不可用" }
+    },
+    {
+      "id": "mem-02",
+      "category": "memory",
+      "input": "你之前记的我那份工作不对，删掉那条",
+      "expectTool": "forget",
+      "toolArgs": { "handle": "3f9a1c22" },
+      "offline": { "kind": "error", "expectIncludes": "不可用" }
+    },
+    {
+      "id": "none-05",
+      "category": "no-tool",
+      "input": "我今天要出差，晚上再问你结果",
       "expectTool": null,
       "offline": { "kind": "none" }
     }

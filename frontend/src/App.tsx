@@ -2,14 +2,17 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import ApiConfigModal from './components/ApiConfigModal'
 import AuthView from './components/AuthView'
 import ChatInterface from './components/ChatInterface'
-import type { ApiConfig, Conversation, Message, ToolStep } from './types'
+import type { ApiConfig, Conversation, Message, ProviderType, ToolStep } from './types'
 import {
   UNAUTHORIZED_EVENT,
   ChatStreamError,
+  activateConfig,
+  clearConfig,
   createConversation,
+  deleteConfig,
   deleteConversation as apiDeleteConversation,
   truncateConversation,
-  fetchConfig,
+  fetchConfigs,
   fetchConversation,
   fetchConversations,
   fetchCurrentUser,
@@ -19,12 +22,14 @@ import {
   resumeChat,
   setAuthToken,
   saveConfig,
-  clearConfig,
   streamChat,
 } from './client'
-import type { AuthSession, AuthUser, ConfigResponse, ModelInfo } from './client'
+import type { AuthSession, AuthUser, ConfigListResponse, ModelInfo } from './client'
 
 const BACKEND_DOWN = '无法连接到后端服务，请确认已启动 npm run dev:api'
+
+/** 配置列表的空态：切账号、后端不可用时都回到这里 */
+const NO_CONFIG: ConfigListResponse = { configured: false, active: null, items: [] }
 
 /**
  * 断线续传次数上限与退避基数（第 n 次等 n×1.2 秒）。
@@ -72,14 +77,21 @@ function App() {
   const [activeConversationId, setActiveConversationId] = useState<string>('')
   const [isSending, setIsSending] = useState(false)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
-  const [configStatus, setConfigStatus] = useState<ConfigResponse | null>(null)
-  const [hasConfig, setHasConfig] = useState(false)
+  const [configList, setConfigList] = useState<ConfigListResponse>({
+    configured: false,
+    active: null,
+    items: [],
+  })
+  // 有生效那份才有 Key 可用：没有就既不能发问题，也不该让用户以为界面坏了
+  const hasConfig = configList.active !== null
   const [configModalOpen, setConfigModalOpen] = useState(false)
   const [user, setUser] = useState<AuthUser | null>(null)
   // 免登录模式（后端 AUTH_ENABLED != true）：不渲染登录页，也不给「退出登录」入口
   const [demoMode, setDemoMode] = useState(false)
   // 首屏要先拿 token 换登录态，其间既不该闪登录页也不该闪聊天页
   const [booting, setBooting] = useState(true)
+  // 模型自己调 remember/forget 会改动记忆清单，清单不在这个状态里就没人知道要重取
+  const [memoryRevision, setMemoryRevision] = useState(0)
   const abortRef = useRef<AbortController | null>(null)
 
   /** 拉会话列表，没有就建一个；返回当前应使用的会话。 */
@@ -101,8 +113,7 @@ function App() {
   const resetWorkspace = useCallback(() => {
     setConversations([])
     setActiveConversationId('')
-    setConfigStatus(null)
-    setHasConfig(false)
+    setConfigList(NO_CONFIG)
     setConfigModalOpen(false)
     setErrorMessage(null)
   }, [])
@@ -111,11 +122,10 @@ function App() {
   const loadWorkspace = useCallback(async (): Promise<void> => {
     resetWorkspace()
     try {
-      const cfg = await fetchConfig()
-      setConfigStatus(cfg)
-      setHasConfig(cfg !== null)
+      const cfg = await fetchConfigs()
+      setConfigList(cfg)
       // 没配 Key 就直接把弹窗摆出来：登录后要做的第一件事只有这一件
-      setConfigModalOpen(cfg === null)
+      setConfigModalOpen(cfg.active === null)
       await loadConversations()
     } catch {
       // Backend not available yet
@@ -296,7 +306,9 @@ function App() {
     }
 
     const onStep = (step: ToolStep) => {
-      // calling 追加新条目；done/error 回填同 id 步骤，续传后的新步骤 id 不会与旧的相撞
+      // calling 追加新条目；streaming 累加增量；done/error 回填同 id 步骤，
+      // 续传后的新步骤 id 不会与旧的相撞
+      const terminal = step.status === 'done' || step.status === 'error'
       if (step.status === 'calling') {
         liveSteps.push(step)
       } else {
@@ -304,10 +316,22 @@ function App() {
           ? liveSteps.findIndex((s) => s.id === step.id)
           : liveSteps.findLastIndex((s) => s.name === step.name && s.result === undefined)
         if (matchIndex >= 0) {
-          liveSteps[matchIndex] = { ...liveSteps[matchIndex], ...step }
+          const prev = liveSteps[matchIndex]
+          liveSteps[matchIndex] = {
+            ...prev,
+            ...step,
+            // 增量只在执行期间有意义：终态的 result 就是全文，留着 delta 会显示两遍
+            delta: terminal ? undefined : (prev.delta ?? '') + (step.delta ?? ''),
+            progress: terminal ? undefined : step.progress ?? prev.progress,
+          }
         } else {
           liveSteps.push(step)
         }
+      }
+      // 清单是模型改的，界面只能从工具终态得知；不重取的话面板会一直停在旧内容，
+      // 用户看不到「它到底记了什么」，也就没机会纠正
+      if (terminal && (step.name === 'remember' || step.name === 'forget')) {
+        setMemoryRevision((n) => n + 1)
       }
       updateAssistant((message) => ({ ...message, steps: [...liveSteps] }))
     }
@@ -548,19 +572,40 @@ function App() {
     setErrorMessage(null)
   }
 
-  const handleSaveConfig = async (config: ApiConfig) => {
-    await saveConfig(config)
-    const cfg = await fetchConfig()
-    setConfigStatus(cfg)
-    setHasConfig(true)
-    setConfigModalOpen(false)
+  /** 保存/切换/删除都重新取一次列表：生效指针由后端决定，前端不自己推断「哪份该显示成当前使用」 */
+  const refreshConfigs = useCallback(async () => {
+    setConfigList(await fetchConfigs())
+  }, [])
+
+  const handleSaveConfig = async (
+    config: ApiConfig & { routingCandidates: string },
+    options: { apply: boolean },
+  ) => {
+    const { routingCandidates, ...rest } = config
+    await saveConfig(rest, { routingCandidates, apply: options.apply })
+    await refreshConfigs()
+    setErrorMessage(null)
+    // 登录时因为「一家都没配」自动弹出的那个窗，配好就该收了；主动打开的留着方便切
+    if (configList.active === null) {
+      setConfigModalOpen(false)
+    }
+  }
+
+  const handleActivateConfig = async (provider: ProviderType) => {
+    await activateConfig(provider)
+    await refreshConfigs()
+    setErrorMessage(null)
+  }
+
+  const handleDeleteConfig = async (provider: ProviderType) => {
+    await deleteConfig(provider)
+    await refreshConfigs()
     setErrorMessage(null)
   }
 
   const handleClearConfig = async () => {
     await clearConfig()
-    setConfigStatus(null)
-    setHasConfig(false)
+    setConfigList(NO_CONFIG)
   }
 
   const handleOpenConfig = useCallback(() => {
@@ -594,8 +639,9 @@ function App() {
         messages={activeMessages}
         isSending={isSending}
         errorMessage={errorMessage}
-        apiConfig={configStatus}
+        apiConfig={configList.active}
         hasConfig={hasConfig}
+        memoryRevision={memoryRevision}
         onOpenConfig={handleOpenConfig}
         onStop={handleStop}
         onSend={handleSend}
@@ -606,13 +652,18 @@ function App() {
         onDeleteConversation={handleDeleteConversation}
         onLogout={handleLogout}
       />
-      <ApiConfigModal
-        open={configModalOpen}
-        currentConfig={configStatus}
-        onClose={() => setConfigModalOpen(false)}
-        onSave={handleSaveConfig}
-        onClear={handleClearConfig}
-      />
+      {/* 只在使用时挂载：弹窗的表单初值取的是挂载那一刻的配置，常驻会留着上次编辑的残值 */}
+      {configModalOpen ? (
+        <ApiConfigModal
+          active={configList.active}
+          items={configList.items}
+          onClose={() => setConfigModalOpen(false)}
+          onSave={handleSaveConfig}
+          onActivate={handleActivateConfig}
+          onDelete={handleDeleteConfig}
+          onClear={handleClearConfig}
+        />
+      ) : null}
     </>
   )
 }

@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Delete, Body } from '@nestjs/common'
+import { Body, Controller, Delete, Get, Param, Post } from '@nestjs/common'
 import { ConfigService } from './config.service'
 import { SaveApiConfigDto } from './save-api-config.dto'
 import { CurrentUser } from '../auth/auth.decorators'
@@ -10,27 +10,36 @@ export class ConfigController {
 
   @Get()
   async get(@CurrentUser() user: AuthUser) {
-    const config = await this.configService.get(user.id)
-    if (!config) {
-      return { configured: false }
-    }
-    return {
-      configured: true,
-      provider: config.provider,
-      baseUrl: config.baseUrl,
-      model: config.model,
-      apiKeyMasked: `${config.apiKey.slice(0, 4)}****${config.apiKey.slice(-4)}`,
-    }
+    const items = await this.configService.listViews(user.id)
+    const active = items.find((item) => item.active) ?? null
+    return { configured: Boolean(active), active, items }
   }
 
   @Post()
-  save(@CurrentUser() user: AuthUser, @Body() body: SaveApiConfigDto) {
-    return this.configService.save(user.id, {
-      provider: body.provider,
-      apiKey: body.apiKey,
-      baseUrl: body.baseUrl,
-      model: body.model,
-    })
+  async save(@CurrentUser() user: AuthUser, @Body() body: SaveApiConfigDto) {
+    const view = await this.configService.save(
+      user.id,
+      {
+        provider: body.provider,
+        apiKey: body.apiKey,
+        baseUrl: body.baseUrl,
+        model: body.model,
+        routingCandidates: body.routingCandidates ?? null,
+      },
+      body.apply !== false,
+    )
+    return { success: true, config: view }
+  }
+
+  @Post(':provider/activate')
+  async activate(@CurrentUser() user: AuthUser, @Param('provider') provider: string) {
+    return { success: true, config: await this.configService.activate(user.id, provider) }
+  }
+
+  @Delete(':provider')
+  async remove(@CurrentUser() user: AuthUser, @Param('provider') provider: string) {
+    await this.configService.remove(user.id, provider)
+    return { success: true }
   }
 
   @Delete()

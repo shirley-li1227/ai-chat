@@ -4,10 +4,17 @@ import { DataSource } from 'typeorm'
 import { SecretCipher } from '../security/secret-cipher'
 import { TasksService } from '../tasks/task.service'
 import { backgroundTasksEnabled } from '../tasks/task-policy'
-import { routingCandidates, routingEnabled } from '../chat/model-router'
+import { envRoutingCandidates, routingEnabled } from '../chat/model-router'
+import { PROVIDER_IDS } from '../config/providers'
 import { PROMPT_VERSION } from '../chat/prompt'
 import { Public } from '../auth/auth.decorators'
 import { authEnabled } from '../auth/auth-mode'
+import {
+  memoryEnabled,
+  memoryInjectMaxChars,
+  memoryItemMaxChars,
+  memoryMaxEntries,
+} from '../memory/memory-policy'
 
 @Controller('api/health')
 export class HealthController {
@@ -47,13 +54,40 @@ export class HealthController {
       auth: authEnabled() ? 'enabled' : 'disabled',
       // 队列水位：background 为 disabled 而 queued 在涨，说明任务正无人执行地堆积
       background: backgroundTasksEnabled() ? 'enabled' : 'disabled',
-      // 模型路由：候选档位从低到高。空数组等于没开，回答恒用配置里的主力模型。
-      // 线上「这句为什么换了个模型答」要能在这里直接查到，不用重新发布
+      // 模型路由：这里只报环境变量那一份兜底候选——每份配置自带的候选属于每个账号，
+      // 未登录的健康检查看不到别人的配置，账号内看 GET /api/config 的 items[].routingCandidates
       modelRouting: routingEnabled() ? 'enabled' : 'disabled',
-      modelCandidates: routingCandidates(),
+      modelCandidates: envRoutingCandidates(),
+      // 接了哪几家供应商：线上「这家能不能用」不用重新发布就能查到
+      providers: PROVIDER_IDS,
+      memory: memoryEnabled() ? 'enabled' : 'disabled',
+      // 缺表不影响对话（记忆读失败按无记忆处理），但会让 remember 静默失效，
+      // 生产 Postgres 没有迁移目录，这一项就是「DDL 跑没跑」的现成答案
+      memoryTable: await this.probeMemoryTable(),
+      memoryLimits: {
+        maxEntries: memoryMaxEntries(),
+        itemMaxChars: memoryItemMaxChars(),
+        injectMaxChars: memoryInjectMaxChars(),
+      },
       tasks: await this.tasks.stats(),
       uptime: Math.round(process.uptime()),
       timestamp: new Date().toISOString(),
+    }
+  }
+
+  /**
+   * 只探表在不在，不 COUNT：sqljs 与 Postgres 共用同一条语句，
+   * 空表返回零行也算「表存在」，缺表才会抛错。
+   */
+  private async probeMemoryTable(): Promise<'disabled' | 'up' | 'missing'> {
+    if (!memoryEnabled()) {
+      return 'disabled'
+    }
+    try {
+      await this.dataSource.query('SELECT 1 FROM user_memories LIMIT 1')
+      return 'up'
+    } catch {
+      return 'missing'
     }
   }
 }

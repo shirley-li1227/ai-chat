@@ -1,7 +1,13 @@
+import { isProviderType, providerLabel } from './apiConfig'
 import type {
   ApiConfig,
+  ApiConfigView,
   BackgroundTask,
   Conversation,
+  MemoryItem,
+  MemoryLimits,
+  MemoryList,
+  ProviderType,
   TaskKindInfo,
   ToolStep,
 } from './types'
@@ -83,6 +89,12 @@ function errorMessageFrom(data: { message?: string | string[] } | null): string 
   return Array.isArray(raw) ? raw.join('；') : (raw ?? '')
 }
 
+/** 校验/业务错误统一成一句可操作的中文，带状态码方便用户截图来问 */
+async function errorTextFrom(res: Response, fallback: string): Promise<string> {
+  const data = (await res.json().catch(() => null)) as { message?: string | string[] } | null
+  return errorMessageFrom(data) || `${fallback}（${res.status}）`
+}
+
 async function postAuth<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     method: 'POST',
@@ -150,48 +162,91 @@ export async function logoutUser(): Promise<void> {
 
 // --- Config ---
 
-export interface ConfigResponse {
-  provider: string
-  baseUrl: string
-  model: string
-  apiKeyMasked: string
+/**
+ * 一个账号可以同时保存多家配置，其中只有一份生效。
+ * 列表接口回的是「哪份在用 + 全部有几份」，界面据此同时显示当前供应商和切换入口。
+ */
+export interface ConfigListResponse {
+  configured: boolean
+  active: ApiConfigView | null
+  items: ApiConfigView[]
 }
 
-export async function fetchConfig(): Promise<ConfigResponse | null> {
-  const res = await authedFetch('/config')
-  if (!res.ok) {
-    return null
-  }
-  const text = await res.text()
-  if (!text) {
-    return null
-  }
-  const data = JSON.parse(text) as { configured: boolean } & ConfigResponse
-  if (!data.configured) {
+function toConfigView(raw: Partial<ApiConfigView> | null | undefined): ApiConfigView | null {
+  if (!raw || !isProviderType(raw.provider)) {
     return null
   }
   return {
-    provider: data.provider,
-    baseUrl: data.baseUrl,
-    model: data.model,
-    apiKeyMasked: data.apiKeyMasked,
+    provider: raw.provider,
+    label: typeof raw.label === 'string' ? raw.label : providerLabel(raw.provider),
+    baseUrl: typeof raw.baseUrl === 'string' ? raw.baseUrl : '',
+    model: typeof raw.model === 'string' ? raw.model : '',
+    apiKeyMasked: typeof raw.apiKeyMasked === 'string' ? raw.apiKeyMasked : '',
+    active: raw.active === true,
+    routingCandidates: typeof raw.routingCandidates === 'string' ? raw.routingCandidates : null,
+    updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : '',
   }
 }
 
-export async function saveConfig(config: ApiConfig): Promise<void> {
+export async function fetchConfigs(): Promise<ConfigListResponse> {
+  const res = await authedFetch('/config')
+  if (!res.ok) {
+    return { configured: false, active: null, items: [] }
+  }
+  const data = (await res.json().catch(() => null)) as {
+    configured?: boolean
+    active?: Partial<ApiConfigView>
+    items?: Array<Partial<ApiConfigView>>
+  } | null
+  // 后端未升级时只会回一份平铺的旧结构，至少让当前生效的那份还能显示出来
+  if (!data || !data.active) {
+    return { configured: false, active: null, items: [] }
+  }
+  const active = toConfigView(data.active)
+  const items = (data.items ?? []).map(toConfigView).filter((i): i is ApiConfigView => i !== null)
+  return { configured: Boolean(active) || items.length > 0, active, items }
+}
+
+export async function saveConfig(
+  config: ApiConfig,
+  options: { routingCandidates?: string; apply?: boolean } = {},
+): Promise<ApiConfigView | null> {
   const res = await authedFetch('/config', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(config),
+    body: JSON.stringify({
+      ...config,
+      routingCandidates: options.routingCandidates ?? '',
+      apply: options.apply !== false,
+    }),
   })
   if (!res.ok) {
-    const data = (await res.json().catch(() => null)) as { message?: string | string[] } | null
-    throw new Error(errorMessageFrom(data) || '保存配置失败')
+    throw new Error(await errorTextFrom(res, '保存配置失败'))
+  }
+  const data = (await res.json().catch(() => null)) as { config?: Partial<ApiConfigView> } | null
+  return toConfigView(data?.config)
+}
+
+/** 切换生效供应商：只改「哪份在用」，不动任何一家的 Key */
+export async function activateConfig(provider: ProviderType): Promise<void> {
+  const res = await authedFetch(`/config/${provider}/activate`, { method: 'POST' })
+  if (!res.ok) {
+    throw new Error(await errorTextFrom(res, '切换供应商失败'))
+  }
+}
+
+export async function deleteConfig(provider: ProviderType): Promise<void> {
+  const res = await authedFetch(`/config/${provider}`, { method: 'DELETE' })
+  if (!res.ok) {
+    throw new Error(await errorTextFrom(res, '删除配置失败'))
   }
 }
 
 export async function clearConfig(): Promise<void> {
-  await authedFetch('/config', { method: 'DELETE' })
+  const res = await authedFetch('/config', { method: 'DELETE' })
+  if (!res.ok) {
+    throw new Error(await errorTextFrom(res, '清空配置失败'))
+  }
 }
 
 
@@ -424,6 +479,78 @@ export async function cancelTask(id: string): Promise<BackgroundTask> {
     return taskError(res, '取消后台任务失败')
   }
   return toTask((await res.json()) as RawTask)
+}
+
+// --- Long-term memory ---
+
+interface RawMemory {
+  id: string
+  handle: string
+  content: string
+  source: MemoryItem['source']
+  /** 后端 Date 序列化成 ISO 串，sqljs 与 Postgres 还可能给成毫秒数 */
+  updatedAt: string | number
+}
+
+function toMemory(raw: RawMemory): MemoryItem {
+  const parsed = typeof raw.updatedAt === 'number' ? raw.updatedAt : Date.parse(raw.updatedAt)
+  return {
+    id: raw.id,
+    handle: raw.handle,
+    content: raw.content,
+    source: raw.source,
+    updatedAt: Number.isFinite(parsed) ? parsed : Date.now(),
+  }
+}
+
+async function memoryError(res: Response, fallback: string): Promise<never> {
+  const data = (await res.json().catch(() => null)) as { message?: string | string[] } | null
+  throw new Error(errorMessageFrom(data) || `${fallback}（${res.status}）`)
+}
+
+/** 增删改都回整份清单 + 一句中文说明：写入会连带淘汰旧条目，只回新增那条会显示成少了一条 */
+type MemoryMutation = MemoryList & { message: string }
+
+function toMemoryList(data: { items: RawMemory[]; limits: MemoryLimits }): MemoryList {
+  return { items: data.items.map(toMemory), limits: data.limits }
+}
+
+export async function fetchMemories(): Promise<MemoryList> {
+  const res = await authedFetch('/memories')
+  if (!res.ok) {
+    return memoryError(res, '获取长期记忆失败')
+  }
+  return toMemoryList((await res.json()) as { items: RawMemory[]; limits: MemoryLimits })
+}
+
+export async function createMemory(content: string): Promise<MemoryMutation> {
+  const res = await authedFetch('/memories', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content }),
+  })
+  if (!res.ok) {
+    return memoryError(res, '保存记忆失败')
+  }
+  const data = (await res.json()) as {
+    items: RawMemory[]
+    limits: MemoryLimits
+    message: string
+  }
+  return { ...toMemoryList(data), message: data.message }
+}
+
+export async function deleteMemory(id: string): Promise<MemoryMutation> {
+  const res = await authedFetch(`/memories/${id}`, { method: 'DELETE' })
+  if (!res.ok) {
+    return memoryError(res, '删除记忆失败')
+  }
+  const data = (await res.json()) as {
+    items: RawMemory[]
+    limits: MemoryLimits
+    message: string
+  }
+  return { ...toMemoryList(data), message: data.message }
 }
 
 // --- Chat (SSE stream) ---
