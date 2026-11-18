@@ -14,6 +14,8 @@ npm run install:all     # 前后端依赖（仓库根执行）
 npm run dev:api         # 后端 :3001，nest start --watch
 npm run dev             # 前端 :5173，/api 走 Vite 代理
 npm run build           # 前端 → frontend/dist，后端 → functions/api/dist
+npm run verify          # 静态四件套并行（typecheck+build:api+eval / lint / build:frontend），实测约 4s，串行约 8s
+npm run verify:live     # live 栈：假上游 + 临时库 + 真后端，49 项协议断言，实测约 5s
 npm run lint            # 仅前端 eslint
 npm run typecheck       # 仅后端 tsc --noEmit
 npm run eval            # 离线回归（79 项断言，分 12 组，无需网络与 Key）
@@ -56,6 +58,10 @@ functions/api/src/
   conversations/         会话与消息实体/服务
   security/              AES-256-GCM 加解密、URL 内网拦截
   health/                探活（promptVersion / auth / background / modelRouting / memory）
+functions/api/evals/
+  run-evals.mjs          离线断言（79 项 / 12 组，只吃纯函数与编译产物）
+  live/                  live 栈：fake-upstream + seed + check-chat + check-config + run-live（一条命令起全套，49 项协议断言）
+scripts/verify.mjs       静态四件套的并行编排（npm run verify）
 ```
 
 ## 硬性约束
@@ -114,11 +120,26 @@ functions/api/src/
 
 ## 改完怎么验
 
-1. `npm run typecheck` + `npm run lint` + `npm run build`，再 `npm run eval`。绿了只说明**代码能跑**，不说明功能对了。
-2. 界面改动必须真在浏览器里走一遍主路径和边界（空态、错误态、加载中），做不到就明说没做，不要声称成功。
-3. **验证不得污染真实数据**：不碰 `functions/api/data/app.db`，不覆盖用户已保存的 API Key。用临时目录里的独立 `.db` + 假密钥 + 非默认端口 + 进程内假上游；端口占用时先查属主，别误杀用户正在跑的开发服务。
-4. 需要写库的校验逻辑（例如 `baseUrl` 必须 https）属于产品约束，**不要为了演示放宽**，改走服务层直接播种。
-5. **部署、发布、上线只在用户明确要求时执行。** 默认交付到本地验证通过为止。
+分三层，逐层更慢也更接近真相。**别只跑第一层就宣称功能对了。**
+
+1. `npm run verify`——typecheck、后端构建、79 项离线断言、前端 lint、前端构建，并行跑（约 4s）。
+   它替代了「四条命令排着敲一遍」，覆盖范围一样；绿了只说明**代码能跑**，不说明功能对了。
+   只想跑其中几步：`npm run verify -- --only=typecheck,eval`。
+2. `npm run verify:live`——把 `functions/api/evals/live/` 那套起来跑 49 项协议断言（约 5s）：
+   假上游（`127.0.0.1`）+ 临时目录里的独立 `.db` + 每次随机的 `ENCRYPTION_KEY` + 真后端 `dist/main.js`（默认 `:4101`）。
+   断言的是装配之后才成立的行为：SSE 事件顺序与 `[DONE]` 收尾、断线半截落库与续传只补增量且沿用档位、
+   上游 401 判死不重连、模型按档位落档、切家后请求真带那把 Key 且走那条路径、按家校验与生效指针与删除后自动顶上、
+   记忆写入去重注入与关闭后不再广播、工具事件每条带 `tool_call_id`、SSRF 护栏、明文 Key 不进响应也不进库。
+   跑完自动删临时目录；失败保留并打印路径，`upstream.jsonl` 是每条上游请求的证人。
+   子集：`--only=chat-core|chat-memory|chat-memory-off|config`；留现场：`--keep`；端口被占：`--api-port` / `--upstream-port`。
+3. 界面改动必须真在浏览器里走一遍主路径和边界（空态、错误态、加载中），做不到就明说没做，不要声称成功。
+   live 栈证的是协议，证不了「看得对不对」；假上游也不会自己决定调哪个工具，模型选择命中率仍靠 `npm run eval:online`。
+
+**污染真实数据这件事由第 2 层的脚本兜住，不用每次重新当心**：库在系统临时目录、密钥是假串、主密钥每次随机、端口被占只报属主不杀进程。
+仍不许为了跑通而改 `functions/api/data/app.db` 或放宽校验：
+`baseUrl` 必须 https 这类是产品约束，live 栈的播种走数据层（`evals/live/seed.mjs`），HTTP 层的拦截照旧生效并被断言。
+
+**部署、发布、上线只在用户明确要求时执行。** 默认交付到本地验证通过为止。
 
 ## 代码风格
 

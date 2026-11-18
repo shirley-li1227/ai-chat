@@ -84,21 +84,38 @@ npm run dev
 ### 本地演示：断线自动续传
 
 这条链路只在本地演：它需要一个「故意把流掐断」的假上游，线上没法可控地制造断流。三个服务都跑在 `127.0.0.1`，不联网、不用真实密钥。
-同一套假上游顺带也能演模型路由——它会把每次请求带的 `model` 打进日志，换档与「续传不换模型」都看得见。
+**协议部分已经不用手演了**：`npm run verify:live` 里 `chat-core` 那 14 项就包含「掐断只落半截、续传只补增量、上下游档位不变、上游恰好收到两次请求」。
+这一节剩下的价值是**在浏览器里看界面**——提示文案、气泡合并、模型标记是否跟着变，这些只有人眼能判。
 
-1. 起一个假上游（几十行的 Node 脚本即可）：`POST /v1/chat/completions` 第一次请求吐两段就 `res.destroy()`，之后正常吐完并补 `finish_reason: stop` + `data: [DONE]`。
-2. 后端指向**临时库**启动，别用 `functions/api/data/app.db`：
-   `NODE_ENV=development DB_TYPE=sqljs DB_LOCATION=<临时目录>/demo.db ENCRYPTION_KEY=<64 位十六进制> AUTH_ENABLED=false MODEL_ROUTING_CANDIDATES=test-flash,test-pro PORT=3001 node dist/main.js`
-   候选档位随手写两个假名字即可，假上游只认「请求里带的 model 是哪个」。这里走的是 env 兜底：播种的配置没填 `routingCandidates`，才会读到 `MODEL_ROUTING_CANDIDATES`。
-3. 把配置写进那个临时库。`baseUrl` 有「必须 https」的产品级校验，本地假上游是 http，所以**不要为此放宽校验**，直接调 `ConfigService.save(userId, {...})` 播种（校验只在 DTO 层，运行时不再复查）。用户 id 从 `GET /api/auth/mode` 拿。
-4. 起前端 `npm run dev`，浏览器先发一句短问候，再发一句「请仔细分析这段代码的性能问题，并给出优化方案（中途掐断一下）」。预期：前者气泡标 `test-flash`，后者标 `test-pro`；后者先逐字出现前半段，接着提示「连接中断，正在第 1/3 次自动续传…」，最后合并成一条完整回答并显示「网络曾中断，回答已从断点续写完成。」，模型标记不变。
-5. 核对落库：`GET /api/conversations/:id` 应该只有一条 user + 一条 assistant，assistant 内容是完整回答且 `model` 仍是 `test-pro`；假上游日志应该恰好两次请求，两次的 `model` 相同。
+1. 起假上游（问题里带 `[[cut]]` 就吐两段然后毁连接，其它按标记吐工具调用）：
+   ```bash
+   cd functions/api
+   UPSTREAM_PORT=4102 UPSTREAM_LOG=/tmp/upstream.jsonl node evals/live/fake-upstream.mjs
+   ```
+2. 播种一个**临时库**（别用 `functions/api/data/app.db`）：`ENCRYPTION_KEY=<64 位十六进制> node evals/live/seed.mjs --db=<临时目录>/demo.db --upstream=http://127.0.0.1:4102`
+   它写进 `routingCandidates=test-flash,test-pro`，所以档位候选走的是配置而不是环境变量。
+   `baseUrl` 有「必须 https」的产品级校验，假上游是 http，这里**没有为此放宽校验**，而是绕开 DTO 直接落数据层（校验只在 DTO 层，运行时不再复查）。
+3. 用同一把主密钥起后端在 **:3001**（前端 Vite 代理固定指向它；先确认这个端口没被自己的 `dev:api` 占着）：
+   `NODE_ENV=development DB_TYPE=sqljs DB_LOCATION=<临时目录>/demo.db ENCRYPTION_KEY=<同一把> AUTH_ENABLED=false PORT=3001 node dist/main.js`
+4. 起前端 `npm run dev`，浏览器先发一句短问候，再发一句「请仔细分析这段代码的性能问题并给出优化方案：def solve(n): return n * n [[cut]]」。
+   预期：前者气泡标 `test-flash`，后者标 `test-pro`；后者先逐字出现前半段，接着提示「连接中断，正在第 1/3 次自动续传…」，
+   最后合并成一条完整回答并显示「网络曾中断，回答已从断点续写完成。」，模型标记不变。
+5. 核对落库：`GET /api/conversations/:id` 应该只有一条 user + 一条 assistant，assistant 内容是完整回答且 `model` 仍是 `test-pro`；
+   假上游日志（`/tmp/upstream.jsonl`）应该恰好两次请求，两次的 `model` 相同。
 
 > 关键实现约束：断线检测挂在 **`res` 的 `close`** 上并用 `writableEnded` 区分「正常写完」与「半路被关」。挂在 `req` 上没用——Node 在请求体读完时就发出 `req` 的 `close`，那时回答还没开始生成，控制器挂监听时事件早已过去，等于永远检测不到断线，服务端会闷头把整段跑完再落库。
 
 ### 本地演示：跨会话长期记忆与工具实时进度
 
-这两条要真实的上游模型（假上游不会自己决定调工具），所以用你自己那把 DeepSeek Key，但**仍然别用默认库**：按上一节的办法起在临时 `.db` + 非默认端口上，否则会往 `functions/api/data/app.db` 里写演示数据、覆盖你已保存的 Key。
+这两条要真实的上游模型（假上游不会自己决定调工具，它只按问题里的标记回话），所以用你自己那把 DeepSeek Key，但**仍然别用默认库**：
+起一个**空的**临时库并在弹窗里填自己的 Key（不要用上一节播种出来的那份库，里面的假 Key 打不到真实网关），否则会往 `functions/api/data/app.db` 里写演示数据、覆盖你已保存的 Key。
+
+```bash
+# 先确认 :3001 没被自己的 dev:api 占着（前端代理固定指它）
+cd functions/api
+NODE_ENV=development DB_TYPE=sqljs DB_LOCATION=<临时目录>/memory.db \
+  ENCRYPTION_KEY=<64 位十六进制> AUTH_ENABLED=false PORT=3001 node dist/main.js
+```
 
 1. 说「记一下，我以后都要中文回答，我在做一个 NestJS 项目」→ 预期两次 `remember` 调用，工具卡片终态文案「已记住（编号 a1b2c3d4）」；顶栏「长期记忆」面板出现两条，来源徽章都是「模型记的」
 2. **开一个新会话**问「你还记得我在做什么吗」→ 不复述清单、不报编号，直接按记忆作答。这一步是「跨会话」唯一的可见证据
@@ -137,13 +154,14 @@ ai-chat/
 │       │   ├── tasks/          # 后台任务：实体、队列策略、类型注册表、REST 接口（不含执行器）
 │       │   ├── security/       # AES-256-GCM 加解密、URL 内网拦截
 │       │   └── health/         # 探活接口（含 promptVersion / auth / background / modelRouting / memory 水位）
-│       ├── evals/              # 提示词/工具回归集（不随函数包上传）
+│       ├── evals/              # 回归集（不随函数包上传）：run-evals.mjs 离线断言 + live/ 一条命令起的验证栈
 │       ├── dist/               # 构建产物，云函数实际执行的代码
 │       ├── data/               # SQLite 数据库文件（仅本地，自动创建）
 │       ├── scf_bootstrap       # HTTP 云函数启动入口（LF，监听 9000）
 │       └── package.json
 ├── cloudbaserc.json            # CloudBase 部署配置（functionRoot: ./functions）
-├── package.json                # 仓库根编排脚本（install:all / dev / build）
+├── scripts/verify.mjs          # 静态验证的并行编排（npm run verify）
+├── package.json                # 仓库根编排脚本（install:all / dev / build / verify / verify:live）
 ├── PRD.md                      # 产品需求与实现对照
 ├── DEMO_CHECKLIST.md           # 线上演示清单：能演什么、怎么演、哪些演不了
 ├── TECH_DESIGN.md              # 技术设计（架构 / 数据模型 / 接口 / 设计取舍）
@@ -180,15 +198,40 @@ npm run build:frontend   # → frontend/dist
 npm run build:api        # → functions/api/dist
 ```
 
-## 回归评测
+## 改完怎么验（三层）
 
-提示词改一个字，工具命中率就可能变。`functions/api/evals/` 是一份可重跑的固定集，用来把“我优化了提示词”变成可比较的数字。
+一层比一层慢，也一层比一层接近真相。都在仓库根执行，全程不联网、不用真实 Key。
 
 ```bash
-npm run eval                                       # 离线：79 项断言分 12 组（提示词/工具行为/上下文/并发/注册表/后台任务/鉴权模式/断点续传/模型路由/长期记忆/工具流式/多供应商），不需要网络与 API Key
-$env:EVAL_API_KEY="sk-..."; npm run eval:online    # 在线：真实调模型测工具选择命中率，会消耗 token
-npm run eval:online -- --min-accuracy=0.9          # 卡命中率下限，低于阈值退出码非 0
+npm run verify                                       # 第 1 层：静态检查并行跑，实测 3.8s（四条命令排着敲约 8.2s）
+npm run verify -- --only=typecheck,eval              # 只跑其中几步
+npm run verify:live                                  # 第 2 层：起完整链路跑协议断言，实测 4.9s（49 项）
+npm run eval                                         # 只跑离线断言（79 项 / 12 组），verify 里已含
+$env:EVAL_API_KEY="sk-..."; npm run eval:online      # 在线：真实调模型测工具选择命中率，会消耗 token
+npm run eval:online -- --min-accuracy=0.9            # 卡命中率下限，低于阈值退出码非 0
 ```
+
+**第 1 层 `npm run verify`** 把 typecheck、后端构建、79 项离线断言、前端 lint、前端构建编成三条道并行
+（[scripts/verify.mjs](file:///D:/MyProject/ai-chat-gitee/scripts/verify.mjs)）。后端那条道里省掉了 `npm run eval` 自带的第二次 `nest build`——同一条道刚刚构建过。
+分道而不是全并行，是因为两个 tsc 同时写 `dist/` 与 `.tsbuildinfo` 会得到「产物来自哪一次都不确定」的假绿。
+任一未过即退出码非 0，并打印每步耗时。绿了只说明**代码能跑**。
+
+**第 2 层 `npm run verify:live`** 把原先每次都要手搓的验证栈固化进了 [functions/api/evals/live/](file:///D:/MyProject/ai-chat-gitee/functions/api/evals/live)：
+假上游（`127.0.0.1:4102`，只按问题里的标记回话）+ 系统临时目录里的独立 `.db` + 每次随机的主密钥 + 真后端 `dist/main.js`（`:4101`），
+跑完自动清理，失败才保留现场并打印路径（`upstream.jsonl` 记着每条上游请求带的模型、Key 尾 4 位与路径，是续传与切家这类断言唯一的证人）。
+覆盖的是**装配之后才成立**的行为，这些离线断言拿纯函数根本测不到：
+
+| 组 | 项数 | 盯住什么 |
+|---|---|---|
+| `chat-core` | 14 | `model` 事件排第一、档位按复杂度落档、增量拼起来逐字等于落库正文、工具事件带 `tool_call_id` 且并发各归各卡、SSRF 拦内网、上游被掐断只落半截、续传只补增量且沿用中断那轮档位、上游 401 判死不重连、切家后请求真带那把 Key 且走那条路径 |
+| `chat-memory-off` | 3 | `MEMORY_ENABLED=false` 时模型看不到 `remember`/`forget`，硬调也被挡下且不打断整轮 |
+| `chat-memory` | 8 | 写入给 8 位编号、新会话靠 system 段注入、同事实只一条、前缀 3 位也认、编号不存在如实说、面板与模型走同一条删除路径 |
+| `config` | 24 | 列表 + 生效指针形状、只回掩码且明文不进响应、按家校验（Key 形态互斥 / https / 跨家候选点名）、留空沿用库里那把、`apply=false` 只存不切、删除后自动顶上、库里是 `gcm1:` 密文 |
+
+子集与留场：`npm run verify:live -- --only=chat-core,config`、`--keep`；端口被占时它只报属主不动别人的进程，换端口用 `--api-port` / `--upstream-port`。
+
+**第 3 层是真在浏览器里点一遍**（下面的「本地演示」两节）。live 栈证的是协议，证不了「看得对不对」；
+假上游也不会自己决定调哪个工具，「模型到底会不会调 `remember`」只能靠 `npm run eval:online` 测命中率。
 
 用例覆盖范围、`PROMPT_VERSION` 与用例版本互相钉死的机制见 `TECH_DESIGN.md`「提示词版本化与回归评测」。
 
@@ -333,5 +376,6 @@ curl https://<envId>.service.tcloudbase.com/api/tasks -H "Authorization: Bearer 
 - 前端 Vite HMR 即时更新；修改 `frontend/vite.config.ts` 需重启前端
 - 本地 SQLite 数据库文件位于 `functions/api/data/app.db`，首次启动自动创建表结构（synchronize: true）
 - 改了后端 `src` 必须 `npm run build:api` 再 `tcb fn deploy`：`ignore` 排除了 `src` 与 `evals`，云端跑的是包内 `dist/`（仅在明确要求时才发布）
+- 验证按「改完怎么验（三层）」跑：`npm run verify` 一条命令顶掉过去排着敲的四条，`npm run verify:live` 一条命令顶掉每次手搓的假上游 + 临时库 + 播种脚本（`evals/live` 随仓库走，不再是一次性文件）
 - 改提示词要同时升 `PROMPT_VERSION` 并跑 `npm run eval`，否则版本不一致会直接判失败；仅注释/空白调整不必升版本
 - Agent 相关的可调参数（上下文预算、工具并发、摘要开关、抓取超时）见 `AGENT_CAPABILITIES.md`「可调参数」，完整清单在 `functions/api/.env.example`

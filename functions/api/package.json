@@ -12,7 +12,8 @@
     "start:prod": "node dist/main",
     "typecheck": "tsc --noEmit",
     "eval": "nest build && node evals/run-evals.mjs",
-    "eval:online": "node evals/run-evals.mjs --online"
+    "eval:online": "node evals/run-evals.mjs --online",
+    "eval:live": "node evals/live/run-live.mjs"
   },
   "dependencies": {
     "@nestjs/common": "^11.0.0",
