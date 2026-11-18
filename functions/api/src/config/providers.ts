@@ -39,7 +39,7 @@ export const PROVIDER_REGISTRY: Record<string, ProviderSpec> = {
     id: 'deepseek',
     label: 'DeepSeek',
     defaultBaseUrl: 'https://api.deepseek.com',
-    defaultModel: 'deepseek-chat',
+    defaultModel: 'deepseek-flash',
     apiKeyRule: {
       pattern: /^sk-[A-Za-z0-9_-]{8,}$/,
       message: 'apiKey 格式不正确，DeepSeek 密钥应以 sk- 开头',

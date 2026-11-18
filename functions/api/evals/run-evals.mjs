@@ -1324,9 +1324,19 @@ function presetBlock(src, id) {
   return matched ? matched[0] : null
 }
 
+// 引号风格属于格式化，不属于事实：只认某一种引号会让下面这条一致性断言
+// 在一次纯格式化改动后直接失败，而它拦的本来是该对齐的默认值。
 function fieldOf(block, field) {
-  const matched = block?.match(new RegExp(`${field}: '([^']*)'`))
+  const matched = block?.match(new RegExp(`${field}:\\s*['"]([^'"]*)['"]`))
   return matched ? matched[1] : null
+}
+
+function arrayOf(block, field) {
+  const matched = block?.match(new RegExp(`${field}:\\s*\\[([\\s\\S]*?)\\]`))
+  if (!matched) {
+    return null
+  }
+  return [...matched[1].matchAll(/['"]([^'"]*)['"]/g)].map((m) => m[1])
 }
 
 /** class-validator 的约束类可以脱离管道直接调用，这里只测规则本身 */
@@ -1412,7 +1422,7 @@ check('前端 presets 与后端注册表逐家一致，避免两处各写一份�
   const types = readFileSync(path.join(frontendSrc, 'types.ts'), 'utf8')
   const order = src.match(/PROVIDER_ORDER[^=]*=\s*\[([^\]]*)\]/)
   assert(order, '前端缺少 PROVIDER_ORDER')
-  const listed = order[1].split(',').map((s) => s.trim().replace(/'/g, '')).filter(Boolean)
+  const listed = order[1].split(',').map((s) => s.trim().replace(/["']/g, '')).filter(Boolean)
   assert(
     JSON.stringify([...listed].sort()) === JSON.stringify([...PROVIDER_IDS].sort()),
     `前端可选项 ${listed.join(',')} 与注册表 ${PROVIDER_IDS.join(',')} 不一致`,
@@ -1422,15 +1432,33 @@ check('前端 presets 与后端注册表逐家一致，避免两处各写一份�
   for (const id of PROVIDER_IDS) {
     const block = presetBlock(src, id)
     assert(block, `前端 PROVIDER_PRESETS 缺少 ${id}，选了它会取到 undefined`)
-    assert(union[1].includes(`'${id}'`), `ProviderType 联合类型里没有 ${id}`)
+    assert(union[1].includes(id), `ProviderType 联合类型里没有 ${id}`)
     for (const field of ['defaultBaseUrl', 'defaultModel', 'label']) {
       assert(
         fieldOf(block, field) === providerSpec(id)[field],
         `${id}.${field} 前端是 ${fieldOf(block, field)}，后端是 ${providerSpec(id)[field]}`,
       )
     }
+    // 下拉里的预置项是用户不用打字就能勾到的，勾了就是一份会发出去的请求：
+    // 别家 id、重复项、勾一个模型时落到主力模型之外的默认值，都在这里判死。
+    const options = arrayOf(block, 'modelOptions')
+    assert(options?.length, `${id} 前端缺少非空的 modelOptions 数组`)
+    assert(
+      new Set(options).size === options.length,
+      `${id} 的 modelOptions 有重复：${options.join(',')}`,
+    )
+    assert(
+      options.includes(providerSpec(id).defaultModel),
+      `${id} 的默认模型 ${providerSpec(id).defaultModel} 不在下拉预置里：${options.join(',')}`,
+    )
+    for (const model of options) {
+      assert(
+        providerSpec(id).modelHint.test(model),
+        `${id} 的下拉预置 ${model} 不属于这一家（${providerSpec(id).modelHint}），勾上就是发给错的网关拿 4xx`,
+      )
+    }
   }
-  return `${PROVIDER_IDS.length} 家默认值两处对齐`
+  return `${PROVIDER_IDS.length} 家默认值与下拉预置两处对齐`
 })
 
 check('档位候选：配置里填了以配置为准，留空才退回环境变量', async () => {
@@ -1510,7 +1538,7 @@ async function runOnline() {
     process.exit(1)
   }
   const baseUrl = process.env.EVAL_BASE_URL || 'https://api.deepseek.com/v1'
-  const model = process.env.EVAL_MODEL || 'deepseek-chat'
+  const model = process.env.EVAL_MODEL || 'deepseek-flash'
   const url = llmClient.resolveCompletionsUrl(baseUrl)
 
   suite('tool-selection')

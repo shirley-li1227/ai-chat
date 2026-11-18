@@ -25,7 +25,7 @@
 
 1. 准备一把可用的 DeepSeek API Key（`sk-` 开头）。**线上实例里没有 Key**，第一次打开会提示「尚未配置大模型 API」。
 2. 无痕窗口打开站点 → 出现「页面访问提示」中间页 → 点「确定访问」。
-3. 右上「API 设置」→ 选 DeepSeek → 粘 Key → 模型名 `deepseek-chat` → 保存并应用。
+3. 右上「API 设置」→ 选 DeepSeek → 粘 Key → 模型名 `deepseek-flash`（`deepseek-chat` / `deepseek-reasoner` 已于 2026-07-24 停用，填了会被上游 4xx）→ 保存并应用。
 4. 打开 `curl https://lucky-lxy-d1g5yv28gd1a13d29.service.tcloudbase.com/api/health` 备着，讲到可观测性时当场贴出来。
 
 > Key 只在这个实例的内存与 `/tmp` 里存活。演示中途若被路由到新实例或发生冷启动，会回到「尚未配置」，重填即可——这本身就是「已知局限」那一节的现场证据。

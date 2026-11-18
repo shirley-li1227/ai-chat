@@ -120,7 +120,7 @@
   纯进度事件不带 `delta` 字段，终态事件带完整 `result` 供前端整段覆盖
 - 每个工具事件都带 `tool_call_id`，前端按它归位到对应卡片（[ChatInterface.tsx:68](file:///D:/MyProject/ai-chat-gitee/frontend/src/components/ChatInterface.tsx#L68)）：一轮并发执行几个工具就有几条独立事件流交错到达，不会画到同一张卡上
 - 卡片执行中显示累加的 delta 与进度行（[ChatInterface.tsx:41](file:///D:/MyProject/ai-chat-gitee/frontend/src/components/ChatInterface.tsx#L41)），终态换成 `result`。两者由同一份抽取器保证逐字相同（[agent/html-text.ts:45](file:///D:/MyProject/ai-chat-gitee/functions/api/src/agent/html-text.ts#L45)），所以不会先长出来又被改写
-- 顶栏显示最近一条回答**实际用的模型**，前面带生效那一份的供应商标（`智谱 GLM · glm-air`），每条回答自己标一份（悬停给理由）；配置里那个主力模型名不再等于答案来源，多家并存后「刚才这句是谁答的」也不会糊
+- 顶栏显示最近一条回答**实际用的模型**，前面带生效那一份的供应商标（`智谱 GLM · glm-5.3-flash`），每条回答自己标一份（悬停给理由）；配置里那个主力模型名不再等于答案来源，多家并存后「刚才这句是谁答的」也不会糊
 - 「长期记忆」面板（顶栏入口 + 右侧抽屉）列出该账号记住的每条事实：来源徽章（模型记的 / 用户手写的）、`[a1b2c3]` 短编号（悬停说明「Agent 用这个编号忘掉它」）、更新时间，逐条可「忘掉这条」；底部可手动补一条并实时显示字数/上限
 - 面板副标题把当前口径摊开：`跨会话生效 · 最多 100 条 · 单条 200 字`（读的是 `/api/memories` 返回的 `limits`，改环境变量后界面跟着变，不用重新发布）；空态与读取失败各自有明确文案，失败带「重试」（[MemoryPanel.tsx](file:///D:/MyProject/ai-chat-gitee/frontend/src/components/MemoryPanel.tsx)）
 - 模型 `remember`/`forget` 成功后前端即时重拉面板，用户看到的清单与模型口中的清单不留不一致窗口
@@ -159,7 +159,7 @@
 
 - 提示词与工具描述集中在 `chat/prompt.ts` 并版本化，[evals/cases.json](file:///D:/MyProject/ai-chat-gitee/functions/api/evals/cases.json) 钉住同一版本号：两边不一致评测直接失败
 - 离线回归 `npm run eval`（[functions/api/package.json:14](file:///D:/MyProject/ai-chat-gitee/functions/api/package.json#L14)）：**79 项断言**，无需网络与 Key。覆盖工具结果、异常路径、SSRF 护栏、上下文裁剪、并发语义，工具注册表与任务队列的结构不变量、鉴权模式判定（只认字面 `true`、与后台任务开关互不串线）、断点续传的上下文拼装不变量（前缀顺序、半截去重、缺问补份、拒绝条件、可重试返回码、工具轨迹合并不重不漏）、模型路由的分档不变量（未配置或显式关闭恒等主力、候选解析与低到高顺序、分数线性落档且封顶不越白名单、续传沿用白名单内的中断那轮模型、缺记录或模型已下架时回退路由器）
-- `multi-provider`（7 项）：注册表自洽（id 不重复、每家 label/默认 baseUrl/默认模型/文档链接齐全、三条规则是正则且错误文案够长能告诉用户该改成什么、`modelHint` 存在否则跨家候选挡不住）、Key 格式规则按家取且样例互斥（别家的 Key 挡得下、留空放行）、baseUrl 只认 https 且允许带路径、前端 `PROVIDER_PRESETS`/`ProviderType`/`PROVIDER_ORDER` 与后端注册表逐家对齐、候选优先级「配置 > env」、跨家候选保存即被拒且点名到具体模型、路由用配置候选时不依赖环境变量
+- `multi-provider`（7 项）：注册表自洽（id 不重复、每家 label/默认 baseUrl/默认模型/文档链接齐全、三条规则是正则且错误文案够长能告诉用户该改成什么、`modelHint` 存在否则跨家候选挡不住）、Key 格式规则按家取且样例互斥（别家的 Key 挡得下、留空放行）、baseUrl 只认 https 且允许带路径、前端 `PROVIDER_PRESETS`/`ProviderType`/`PROVIDER_ORDER` 与后端注册表逐家对齐（含 `modelOptions` 预置项：非空、无重复、默认模型在内、每一项都归属这一家）、候选优先级「配置 > env」、跨家候选保存即被拒且点名到具体模型、路由用配置候选时不依赖环境变量
 - `long-term-memory`（7 项）：开关只认字面 `false` 且三类上限都有兜底、去重看归一化后的内容、注入按新→旧且超预算的计入 `omitted`、注入文本自带编号与三条行为约束、编号解析（完整 / 唯一前缀 / 歧义 / 不存在）、`remember`+`forget` 随开关一起广播、**记忆只进 system 段绝不混进会话历史**
 - `tool-streaming`（5 项）：三段式事件每条带 `id` 与 `name`、HTML 抽取与切分方式无关（任意分块拼起来逐字等于整篇）、抽取口径（标签与空白折叠、注释与脚本整段丢弃、实体还原）、正文到上限即停止产出且 delta 累加不超过终态 `result`、跨块多字节字符按 stream 模式解码才不变形
 - 在线评测 `npm run eval:online`（[functions/api/package.json:15](file:///D:/MyProject/ai-chat-gitee/functions/api/package.json#L15)）：只看模型选了哪个工具，按分类统计命中率
