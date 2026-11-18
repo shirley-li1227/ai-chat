@@ -1,45 +1,86 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import type { FormEvent } from 'react'
-import type { ApiConfig, ApiConfigView, ProviderType } from '../types'
+import { useCallback, useEffect, useMemo, useState } from "react";
+import type { FormEvent } from "react";
+import type { ApiConfig, ApiConfigView, ProviderType } from "../types";
 import {
   PROVIDER_ORDER,
   PROVIDER_PRESETS,
   buildChatCompletionsUrl,
-  createDefaultConfig,
   isHttpsBaseUrl,
-} from '../apiConfig'
+} from "../apiConfig";
+import ModelMultiSelect from "./ModelMultiSelect";
 
-interface Draft extends ApiConfig {
-  /** 该家的模型档位候选，从低到高逗号分隔；留空表示这家不换档 */
-  routingCandidates: string
+/** 表单在内存里的形态：模型是一个有序清单，保存时才摊成 model + routingCandidates */
+interface Draft {
+  provider: ProviderType;
+  apiKey: string;
+  baseUrl: string;
+  /** 已选模型，顺序即档位从低到高；最后一档同时作为主力模型 */
+  models: string[];
 }
 
 interface ApiConfigModalProps {
   /** 当前生效那份，列表为空时说明这个账号还没配过任何一家 */
-  active: ApiConfigView | null
+  active: ApiConfigView | null;
   /** 这个账号保存过的全部配置，每家最多一份 */
-  items: ApiConfigView[]
-  onClose: () => void
-  onSave: (draft: Draft, options: { apply: boolean }) => Promise<void>
-  onActivate: (provider: ProviderType) => Promise<void>
-  onDelete: (provider: ProviderType) => Promise<void>
-  onClear: () => Promise<void>
+  items: ApiConfigView[];
+  onClose: () => void;
+  onSave: (
+    draft: ApiConfig & { routingCandidates: string },
+    options: { apply: boolean },
+  ) => Promise<void>;
+  onActivate: (provider: ProviderType) => Promise<void>;
+  onDelete: (provider: ProviderType) => Promise<void>;
+  onClear: () => Promise<void>;
 }
 
+function parseModels(raw: string | null | undefined): string[] {
+  const items = (raw ?? "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return [...new Set(items)];
+}
+
+/**
+ * 库里的 model 与 routingCandidates 是两个字段，多选下拉只有一个有序清单，
+ * 所以展开时把主力模型并进来：它不在候选里就被排到最后一档（路由关闭时用它作答）。
+ */
 function draftFrom(
   provider: ProviderType,
   saved: ApiConfigView | undefined,
 ): Draft {
+  const preset = PROVIDER_PRESETS[provider];
   if (!saved) {
-    return { ...createDefaultConfig(provider), routingCandidates: '' }
+    return {
+      provider,
+      apiKey: "",
+      baseUrl: preset.defaultBaseUrl,
+      models: [preset.defaultModel],
+    };
+  }
+  const models = parseModels(saved.routingCandidates);
+  if (saved.model && !models.includes(saved.model)) {
+    models.push(saved.model);
   }
   return {
     provider,
-    apiKey: '',
+    apiKey: "",
     baseUrl: saved.baseUrl,
-    model: saved.model,
-    routingCandidates: saved.routingCandidates ?? '',
-  }
+    models: models.length > 0 ? models : [preset.defaultModel],
+  };
+}
+
+/** 保存载荷：前端多选清单 → 后端两个字段 */
+function payloadOf(draft: Draft): ApiConfig & { routingCandidates: string } {
+  const models = draft.models;
+  return {
+    provider: draft.provider,
+    apiKey: draft.apiKey.trim(),
+    baseUrl: draft.baseUrl.trim(),
+    // 候选为空时路由器恒用主力模型，所以最后一档（最强那档）就是主力
+    model: models[models.length - 1] ?? "",
+    routingCandidates: models.length > 1 ? models.join(",") : "",
+  };
 }
 
 export default function ApiConfigModal({
@@ -56,93 +97,95 @@ export default function ApiConfigModal({
    * 挂在 effect 里重置会在每次列表刷新时把用户正在编辑的内容一起覆盖掉。
    */
   const [provider, setProvider] = useState<ProviderType>(
-    () => active?.provider ?? items.find((item) => item.active)?.provider ?? PROVIDER_ORDER[0],
-  )
-  const [draft, setDraft] = useState<Draft>(() => draftFrom(provider, items.find((i) => i.provider === provider)))
-  const [apply, setApply] = useState(true)
-  const [touched, setTouched] = useState(false)
-  const [busy, setBusy] = useState(false)
-  const [feedback, setFeedback] = useState<string | null>(null)
+    () =>
+      active?.provider ??
+      items.find((item) => item.active)?.provider ??
+      PROVIDER_ORDER[0],
+  );
+  const [draft, setDraft] = useState<Draft>(() =>
+    draftFrom(
+      provider,
+      items.find((i) => i.provider === provider),
+    ),
+  );
+  const [apply, setApply] = useState(true);
+  const [touched, setTouched] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [feedback, setFeedback] = useState<string | null>(null);
 
   const savedOf = useCallback(
     (target: ProviderType) => items.find((item) => item.provider === target),
     [items],
-  )
+  );
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        onClose()
+      if (event.key === "Escape") {
+        onClose();
       }
-    }
-    window.addEventListener('keydown', handler)
-    return () => window.removeEventListener('keydown', handler)
-  }, [onClose])
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [onClose]);
 
-  const preset = PROVIDER_PRESETS[provider]
-  const savedHere = savedOf(provider)
-  const trimmedKey = draft.apiKey.trim()
+  const preset = PROVIDER_PRESETS[provider];
+  const savedHere = savedOf(provider);
+  const trimmedKey = draft.apiKey.trim();
   const errors = {
     /** 留空 = 沿用库里那把 Key，只有这家从没存过时才拦下来 */
-    apiKey: trimmedKey.length === 0 && !savedHere ? '请填写 API Key' : null,
+    apiKey: trimmedKey.length === 0 && !savedHere ? "请填写 API Key" : null,
     baseUrl: draft.baseUrl.trim()
       ? isHttpsBaseUrl(draft.baseUrl)
         ? null
-        : 'Base URL 必须是 https 协议，可以带路径（如 https://open.bigmodel.cn/api/paas/v4）'
-      : '请填写 Base URL',
-    model: draft.model.trim().length === 0 ? '请填写模型名称' : null,
-  }
-  const canSubmit = !errors.apiKey && !errors.baseUrl && !errors.model
+        : "Base URL 必须是 https 协议，可以带路径（如 https://open.bigmodel.cn/api/paas/v4）"
+      : "请填写 Base URL",
+    model: draft.models.length === 0 ? "请至少选择一个模型" : null,
+  };
+  const canSubmit = !errors.apiKey && !errors.baseUrl && !errors.model;
 
   // 已保存列表排在编辑区之前，切换生效供应商是「列表里点一下」而不是「重新填一遍 Key」
   const savedProviders = useMemo(
     () =>
       PROVIDER_ORDER.map((type) => ({ type, view: savedOf(type) })).filter(
-        (row): row is { type: ProviderType; view: ApiConfigView } => Boolean(row.view),
+        (row): row is { type: ProviderType; view: ApiConfigView } =>
+          Boolean(row.view),
       ),
     [savedOf],
-  )
+  );
 
   const handleProviderChange = (next: ProviderType) => {
-    setProvider(next)
-    setDraft(draftFrom(next, savedOf(next)))
-    setTouched(false)
-    setFeedback(null)
-  }
+    setProvider(next);
+    setDraft(draftFrom(next, savedOf(next)));
+    setTouched(false);
+    setFeedback(null);
+  };
 
   /** 保存/切换/删除共用一个 busy：连点两次「设为生效」会把指针翻回前一份 */
   const runAction = async (action: () => Promise<void>) => {
-    setBusy(true)
+    setBusy(true);
     try {
-      await action()
-      setFeedback(null)
+      await action();
+      setFeedback(null);
     } catch (error) {
-      setFeedback(error instanceof Error ? error.message : '操作失败，请稍后重试')
+      setFeedback(
+        error instanceof Error ? error.message : "操作失败，请稍后重试",
+      );
     } finally {
-      setBusy(false)
+      setBusy(false);
     }
-  }
+  };
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-    setTouched(true)
+    event.preventDefault();
+    setTouched(true);
     if (!canSubmit) {
-      return
+      return;
     }
     void runAction(async () => {
-      await onSave(
-        {
-          provider: draft.provider,
-          apiKey: draft.apiKey.trim(),
-          baseUrl: draft.baseUrl.trim(),
-          model: draft.model.trim(),
-          routingCandidates: draft.routingCandidates.trim(),
-        },
-        { apply },
-      )
-      setDraft((prev) => ({ ...prev, apiKey: '' }))
-    })
-  }
+      await onSave(payloadOf(draft), { apply });
+      setDraft((prev) => ({ ...prev, apiKey: "" }));
+    });
+  };
 
   return (
     <div
@@ -152,7 +195,7 @@ export default function ApiConfigModal({
       className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 px-4 py-6 backdrop-blur-sm"
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) {
-          onClose()
+          onClose();
         }
       }}
     >
@@ -160,7 +203,10 @@ export default function ApiConfigModal({
         <form onSubmit={handleSubmit}>
           <header className="flex items-start justify-between border-b border-slate-100 px-6 py-4">
             <div>
-              <h2 id="api-config-title" className="text-lg font-semibold text-slate-800">
+              <h2
+                id="api-config-title"
+                className="text-lg font-semibold text-slate-800"
+              >
                 大模型 API 设置
               </h2>
               <p className="mt-0.5 text-xs text-slate-500">
@@ -173,7 +219,14 @@ export default function ApiConfigModal({
               aria-label="关闭"
               className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
             >
-              <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+              <svg
+                viewBox="0 0 24 24"
+                className="h-5 w-5"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+              >
                 <path d="M6 6l12 12" />
                 <path d="M18 6 6 18" />
               </svg>
@@ -183,15 +236,17 @@ export default function ApiConfigModal({
           <div className="max-h-[70vh] space-y-5 overflow-y-auto px-6 py-5">
             {savedProviders.length > 0 ? (
               <section className="space-y-2">
-                <h3 className="text-sm font-medium text-slate-700">已保存的配置</h3>
+                <h3 className="text-sm font-medium text-slate-700">
+                  已保存的配置
+                </h3>
                 <ul className="space-y-2">
                   {savedProviders.map(({ type, view }) => (
                     <li
                       key={type}
                       className={`flex flex-wrap items-center justify-between gap-2 rounded-xl border px-3 py-2 text-sm ${
                         view.active
-                          ? 'border-emerald-200 bg-emerald-50/70'
-                          : 'border-slate-200 bg-white'
+                          ? "border-emerald-200 bg-emerald-50/70"
+                          : "border-slate-200 bg-white"
                       }`}
                     >
                       <div className="min-w-0">
@@ -204,12 +259,17 @@ export default function ApiConfigModal({
                           ) : null}
                         </span>
                         <p className="mt-0.5 truncate font-mono text-xs text-slate-500">
-                          {view.model} · {view.apiKeyMasked}
+                          {view.routingCandidates
+                            ? view.routingCandidates.split(",").join("、")
+                            : view.model}{" "}
+                          · {view.apiKeyMasked}
                         </p>
                       </div>
                       <div className="flex items-center gap-2">
                         {provider === type ? (
-                          <span className="text-xs text-emerald-600">正在编辑</span>
+                          <span className="text-xs text-emerald-600">
+                            正在编辑
+                          </span>
                         ) : (
                           <button
                             type="button"
@@ -224,7 +284,9 @@ export default function ApiConfigModal({
                           <button
                             type="button"
                             disabled={busy}
-                            onClick={() => void runAction(() => onActivate(type))}
+                            onClick={() =>
+                              void runAction(() => onActivate(type))
+                            }
                             className="text-xs text-emerald-600 underline-offset-2 hover:underline disabled:opacity-50"
                           >
                             设为使用
@@ -246,11 +308,13 @@ export default function ApiConfigModal({
             ) : null}
 
             <div>
-              <label className="mb-2 block text-sm font-medium text-slate-700">服务供应商</label>
+              <label className="mb-2 block text-sm font-medium text-slate-700">
+                服务供应商
+              </label>
               <div className="grid grid-cols-2 gap-3">
                 {PROVIDER_ORDER.map((type) => {
-                  const item = PROVIDER_PRESETS[type]
-                  const selected = provider === type
+                  const item = PROVIDER_PRESETS[type];
+                  const selected = provider === type;
                   return (
                     <button
                       key={type}
@@ -258,34 +322,45 @@ export default function ApiConfigModal({
                       onClick={() => handleProviderChange(type)}
                       className={`rounded-xl border px-3 py-2.5 text-left transition ${
                         selected
-                          ? 'border-emerald-400 bg-emerald-50/80 shadow-sm ring-1 ring-emerald-200'
-                          : 'border-slate-200 bg-white hover:border-slate-300 hover:bg-slate-50'
+                          ? "border-emerald-400 bg-emerald-50/80 shadow-sm ring-1 ring-emerald-200"
+                          : "border-slate-200 bg-white hover:border-slate-300 hover:bg-slate-50"
                       }`}
                     >
                       <span
                         className={`block text-sm font-semibold ${
-                          selected ? 'text-emerald-700' : 'text-slate-700'
+                          selected ? "text-emerald-700" : "text-slate-700"
                         }`}
                       >
                         {item.label}
                       </span>
-                      <span className="mt-0.5 block text-xs text-slate-500">{item.description}</span>
+                      <span className="mt-0.5 block text-xs text-slate-500">
+                        {item.description}
+                      </span>
                     </button>
-                  )
+                  );
                 })}
               </div>
             </div>
 
             <div className="space-y-1.5">
-              <label htmlFor="api-key" className="text-sm font-medium text-slate-700">
+              <label
+                htmlFor="api-key"
+                className="text-sm font-medium text-slate-700"
+              >
                 API Key
               </label>
               <input
                 id="api-key"
                 type="password"
                 value={draft.apiKey}
-                onChange={(event) => setDraft((prev) => ({ ...prev, apiKey: event.target.value }))}
-                placeholder={savedHere ? '留空表示沿用已保存的 Key' : preset.apiKeyPlaceholder}
+                onChange={(event) =>
+                  setDraft((prev) => ({ ...prev, apiKey: event.target.value }))
+                }
+                placeholder={
+                  savedHere
+                    ? "留空表示沿用已保存的 Key"
+                    : preset.apiKeyPlaceholder
+                }
                 autoComplete="off"
                 spellCheck={false}
                 className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 font-mono text-sm text-slate-800 outline-none transition placeholder:text-slate-400 focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100"
@@ -302,44 +377,24 @@ export default function ApiConfigModal({
             </div>
 
             <div className="space-y-1.5">
-              <label htmlFor="api-model" className="text-sm font-medium text-slate-700">
-                {preset.modelLabel}
+              <label className="text-sm font-medium text-slate-700">
+                模型（可多选）
               </label>
-              <input
-                id="api-model"
-                type="text"
-                value={draft.model}
-                onChange={(event) => setDraft((prev) => ({ ...prev, model: event.target.value }))}
+              <ModelMultiSelect
+                key={provider}
+                options={preset.modelOptions}
+                value={draft.models}
+                onChange={(models) => setDraft((prev) => ({ ...prev, models }))}
                 placeholder={preset.modelPlaceholder}
-                autoComplete="off"
-                spellCheck={false}
-                className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 outline-none transition placeholder:text-slate-400 focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100"
+                invalid={touched && Boolean(errors.model)}
               />
               <p className="text-xs text-slate-400">{preset.modelHint}</p>
+              <p className="text-xs text-slate-400">
+                可多选：服务端会按问题复杂度在勾选的模型里自动挑一个；只选一个就固定用它。
+              </p>
               {touched && errors.model ? (
                 <p className="text-xs text-red-500">{errors.model}</p>
               ) : null}
-            </div>
-
-            <div className="space-y-1.5">
-              <label htmlFor="api-candidates" className="text-sm font-medium text-slate-700">
-                模型档位候选（可选）
-              </label>
-              <input
-                id="api-candidates"
-                type="text"
-                value={draft.routingCandidates}
-                onChange={(event) =>
-                  setDraft((prev) => ({ ...prev, routingCandidates: event.target.value }))
-                }
-                placeholder={preset.routingCandidatesHint}
-                autoComplete="off"
-                spellCheck={false}
-                className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 font-mono text-xs text-slate-800 outline-none transition placeholder:text-slate-400 focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100"
-              />
-              <p className="text-xs text-slate-400">
-                按问题复杂度从低到高挑一档；留空则始终用上面的主力模型。
-              </p>
             </div>
 
             <details className="group rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-2">
@@ -350,7 +405,12 @@ export default function ApiConfigModal({
                 <input
                   type="text"
                   value={draft.baseUrl}
-                  onChange={(event) => setDraft((prev) => ({ ...prev, baseUrl: event.target.value }))}
+                  onChange={(event) =>
+                    setDraft((prev) => ({
+                      ...prev,
+                      baseUrl: event.target.value,
+                    }))
+                  }
                   placeholder={preset.defaultBaseUrl}
                   autoComplete="off"
                   spellCheck={false}
@@ -360,12 +420,19 @@ export default function ApiConfigModal({
                   <span>
                     后端将请求：
                     <code className="rounded bg-white px-1 py-0.5 font-mono text-[11px] text-slate-600">
-                      {buildChatCompletionsUrl(draft.baseUrl || preset.defaultBaseUrl)}
+                      {buildChatCompletionsUrl(
+                        draft.baseUrl || preset.defaultBaseUrl,
+                      )}
                     </code>
                   </span>
                   <button
                     type="button"
-                    onClick={() => setDraft((prev) => ({ ...prev, baseUrl: preset.defaultBaseUrl }))}
+                    onClick={() =>
+                      setDraft((prev) => ({
+                        ...prev,
+                        baseUrl: preset.defaultBaseUrl,
+                      }))
+                    }
                     className="text-emerald-600 hover:underline"
                   >
                     恢复默认
@@ -390,7 +457,10 @@ export default function ApiConfigModal({
             </p>
 
             {feedback ? (
-              <p role="alert" className="rounded-xl bg-red-50 px-3 py-2 text-xs text-red-600">
+              <p
+                role="alert"
+                className="rounded-xl bg-red-50 px-3 py-2 text-xs text-red-600"
+              >
                 {feedback}
               </p>
             ) : null}
@@ -413,8 +483,8 @@ export default function ApiConfigModal({
                   disabled={busy}
                   onClick={() =>
                     void runAction(async () => {
-                      await onClear()
-                      setDraft(draftFrom(provider, undefined))
+                      await onClear();
+                      setDraft(draftFrom(provider, undefined));
                     })
                   }
                   className="text-xs text-red-500 underline-offset-2 hover:underline disabled:opacity-50"
@@ -438,12 +508,12 @@ export default function ApiConfigModal({
                 disabled={busy}
                 className="rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 px-4 py-2 text-sm font-medium text-white shadow-sm transition hover:from-emerald-600 hover:to-teal-600 disabled:cursor-not-allowed disabled:from-slate-300 disabled:to-slate-300"
               >
-                {busy ? '处理中...' : `保存 ${preset.label}`}
+                {busy ? "处理中..." : `保存 ${preset.label}`}
               </button>
             </div>
           </footer>
         </form>
       </div>
     </div>
-  )
+  );
 }

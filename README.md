@@ -60,9 +60,9 @@ npm run dev
 想再加一家（例如智谱 GLM）时，同一个弹窗里：
 
 1. 上方「已保存的配置」列出这个账号存过的每一家，标着「当前使用」的那份才是对话真正用的
-2. 切到「智谱 GLM」标签页填 Key（形如 `id.secret` 两段）与模型名，Base URL 默认已带上 `/api/paas/v4` 路径
+2. 切到「智谱 GLM」标签页填 Key（形如 `id.secret` 两段）并勾选该家已开通的模型，Base URL 默认已带上 `/api/paas/v4` 路径
 3. 「保存后设为当前使用」不勾就是**先存着、回头再切**；勾上才把生效位挪过来。已存过 Key 的一家把密钥框留空即表示沿用库里那把，不用为了改模型名重新粘贴密钥
-4. 「模型档位候选」只填这一家确实开通的模型，从低到高逗号分隔；填了别家的名字会在保存时直接被拒并点名，因为那种请求只会换来上游 4xx，而界面上只看得见「答不上来」
+4. 「模型」下拉可勾多个，只勾这一家确实开通的模型；勾了别家的名字会在保存时直接被拒并点名，因为那种请求只会换来上游 4xx，而界面上只看得见「答不上来」
 5. 「删除」只删这一家的配置；删掉的正好是当前使用时，剩下最近更新的那份自动顶上，不会出现没有 Key 可用的空档
 
 > 主密钥 `ENCRYPTION_KEY`（64 位十六进制）缺失或格式非法时，保存会返回明确错误——为避免明文落库，后端不会降级成明文存储。
@@ -71,9 +71,9 @@ npm run dev
 
 ### 场景化模型选择
 
-同一供应商里的几档模型，**服务端按本轮问题的复杂度挑一档**：不新增供应商、不换协议，只在已有配置里多一个候选输入框。
+同一供应商里的几档模型，**服务端按本轮问题的复杂度挑一档**：不新增供应商、不换协议，只在已有配置里把模型改成可多选的下拉。
 
-- 候选档位**从低到高**填在每份配置自己的「模型档位候选」输入框（逗号分隔，如 `deepseek-flash,deepseek-v4-pro`），落库到 `api_config.routingCandidates`。这一层只在一家的模型池里挑，所以候选必须与主力模型同属一家：填了别家的 id 保存时会被拒并点名是哪一条。留空等于不开启，回答恒用配置里的主力模型，行为与开启前完全一致；环境变量 `MODEL_ROUTING_CANDIDATES` 降级为全局兜底，只在配置没填时生效。`MODEL_ROUTING_ENABLED=false` 是总开关，用于对比测试或排障。
+- 在每份配置的「模型」下拉里勾选多个模型即可开启（如 `deepseek-flash` 与 `deepseek-v4-pro`），落库到 `api_config.routingCandidates`。这一层只在一家的模型池里挑，所以勾选的模型必须与主力模型同属一家：勾了别家的 id 保存时会被拒并点名是哪一条。从低到高的换档顺序由服务端按同一家的档位维护，**界面上不出现档位概念**——用户只管勾哪些模型。只勾一个等于不开启，回答恒用它；环境变量 `MODEL_ROUTING_CANDIDATES` 降级为全局兜底，只在配置没填时生效。`MODEL_ROUTING_ENABLED=false` 是总开关，用于对比测试或排障。
 - 模型名不写死在代码里：供应商的 id 会换，用户也未必开通了高那一档。配什么用什么，白名单外的名字永远不会被选中。
 - 判定用的是确定可得的信号——问题长度，加上「要求深入 / 分析设计类 / 含代码 / 格式要求」四类关键词，加权成 0~1 的复杂度分，再按候选数线性分档。刻意不让模型自己「换个模型再答一遍」：那要多一跳工具调用、双份 token、还会白吃掉 `AGENT_MAX_TURNS` 的轮数预算。
 - 界面解释得清：每轮 SSE 开头下发一条 `model` 事件（模型 id、复杂度分、中文理由），顶栏显示最近一条回答实际用的模型，气泡下方标出该条的模型名，悬停看理由。assistant 消息也落库 `model`，刷新后仍知道是谁答的。
@@ -97,7 +97,7 @@ npm run dev
    `baseUrl` 有「必须 https」的产品级校验，假上游是 http，这里**没有为此放宽校验**，而是绕开 DTO 直接落数据层（校验只在 DTO 层，运行时不再复查）。
 3. 用同一把主密钥起后端在 **:3001**（前端 Vite 代理固定指向它；先确认这个端口没被自己的 `dev:api` 占着）：
    `NODE_ENV=development DB_TYPE=sqljs DB_LOCATION=<临时目录>/demo.db ENCRYPTION_KEY=<同一把> AUTH_ENABLED=false PORT=3001 node dist/main.js`
-4. 起前端 `npm run dev`，浏览器先发一句短问候，再发一句「请仔细分析这段代码的性能问题并给出优化方案：def solve(n): return n * n [[cut]]」。
+4. 起前端 `npm run dev`，浏览器先发一句短问候，再发一句「请仔细分析这段代码的性能问题并给出优化方案：def solve(n): return n \* n [[cut]]」。
    预期：前者气泡标 `test-flash`，后者标 `test-pro`；后者先逐字出现前半段，接着提示「连接中断，正在第 1/3 次自动续传…」，
    最后合并成一条完整回答并显示「网络曾中断，回答已从断点续写完成。」，模型标记不变。
 5. 核对落库：`GET /api/conversations/:id` 应该只有一条 user + 一条 assistant，assistant 内容是完整回答且 `model` 仍是 `test-pro`；
@@ -137,7 +137,7 @@ ai-chat/
 │   │   ├── client.ts           # 后端 API 调用层（token / SSE）
 │   │   ├── apiConfig.ts        # 供应商预设 & 表单校验
 │   │   ├── types.ts            # TypeScript 类型定义
-│   │   └── components/         # AuthView / ChatInterface / ApiConfigModal / TaskPanel / MemoryPanel
+│   │   └── components/         # AuthView / ChatInterface / ApiConfigModal / ModelMultiSelect / TaskPanel / MemoryPanel
 │   ├── vite.config.ts          # /api proxy → :3001
 │   └── .env.production         # VITE_API_BASE（跨域部署用）
 ├── functions/
@@ -223,12 +223,12 @@ npm run eval:online -- --min-accuracy=0.9            # 卡命中率下限，低�
 跑完自动清理，失败才保留现场并打印路径（`upstream.jsonl` 记着每条上游请求带的模型、Key 尾 4 位与路径，是续传与切家这类断言唯一的证人）。
 覆盖的是**装配之后才成立**的行为，这些离线断言拿纯函数根本测不到：
 
-| 组 | 项数 | 盯住什么 |
-|---|---|---|
-| `chat-core` | 14 | `model` 事件排第一、档位按复杂度落档、增量拼起来逐字等于落库正文、工具事件带 `tool_call_id` 且并发各归各卡、SSRF 拦内网、上游被掐断只落半截、续传只补增量且沿用中断那轮档位、上游 401 判死不重连、切家后请求真带那把 Key 且走那条路径 |
-| `chat-memory-off` | 3 | `MEMORY_ENABLED=false` 时模型看不到 `remember`/`forget`，硬调也被挡下且不打断整轮 |
-| `chat-memory` | 8 | 写入给 8 位编号、新会话靠 system 段注入、同事实只一条、前缀 3 位也认、编号不存在如实说、面板与模型走同一条删除路径 |
-| `config` | 24 | 列表 + 生效指针形状、只回掩码且明文不进响应、按家校验（Key 形态互斥 / https / 跨家候选点名）、留空沿用库里那把、`apply=false` 只存不切、删除后自动顶上、库里是 `gcm1:` 密文 |
+| 组                | 项数 | 盯住什么                                                                                                                                                                                                                              |
+| ----------------- | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `chat-core`       | 14   | `model` 事件排第一、档位按复杂度落档、增量拼起来逐字等于落库正文、工具事件带 `tool_call_id` 且并发各归各卡、SSRF 拦内网、上游被掐断只落半截、续传只补增量且沿用中断那轮档位、上游 401 判死不重连、切家后请求真带那把 Key 且走那条路径 |
+| `chat-memory-off` | 3    | `MEMORY_ENABLED=false` 时模型看不到 `remember`/`forget`，硬调也被挡下且不打断整轮                                                                                                                                                     |
+| `chat-memory`     | 8    | 写入给 8 位编号、新会话靠 system 段注入、同事实只一条、前缀 3 位也认、编号不存在如实说、面板与模型走同一条删除路径                                                                                                                    |
+| `config`          | 24   | 列表 + 生效指针形状、只回掩码且明文不进响应、按家校验（Key 形态互斥 / https / 跨家候选点名）、留空沿用库里那把、`apply=false` 只存不切、删除后自动顶上、库里是 `gcm1:` 密文                                                           |
 
 子集与留场：`npm run verify:live -- --only=chat-core,config`、`--keep`；端口被占时它只报属主不动别人的进程，换端口用 `--api-port` / `--upstream-port`。
 这条脚本因此直接 `node functions/api/evals/live/run-live.mjs` 而不是 `npm --prefix functions/api run eval:live`：
@@ -243,11 +243,11 @@ npm run eval:online -- --min-accuracy=0.9            # 卡命中率下限，低�
 
 架构：前端走**静态托管**，后端走 **HTTP 云函数**，两者是**不同域名**，前端跨域直调函数网关（不是同域路径转发）。
 
-| 资源 | 地址 |
-|------|------|
-| 前端（静态托管，写在托管桶根目录） | `https://<envId>-<appid>.tcloudbaseapp.com` |
-| 后端（HTTP 云函数网关） | `https://<envId>.service.tcloudbase.com/api` |
-| 本项目当前环境 | envId `lucky-lxy-d1g5yv28gd1a13d29` |
+| 资源                               | 地址                                         |
+| ---------------------------------- | -------------------------------------------- |
+| 前端（静态托管，写在托管桶根目录） | `https://<envId>-<appid>.tcloudbaseapp.com`  |
+| 后端（HTTP 云函数网关）            | `https://<envId>.service.tcloudbase.com/api` |
+| 本项目当前环境                     | envId `lucky-lxy-d1g5yv28gd1a13d29`          |
 
 ### 前置条件
 
@@ -311,7 +311,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS "UQ_api_config_user_provider" ON api_config ("
    ```
 7. **`BACKGROUND_TASKS_ENABLED` 保持 `false`**，直到后台执行器（独立常驻进程）真的部署起来。设为 `true` 会把 `run_in_background` 广播给模型，模型随即开始提交没人执行的任务——队列只会堆积，界面永远显示「排队中」。全部可调变量的默认值与含义见 `functions/api/.env.example`
 8. **`AUTH_ENABLED` 在 `cloudbaserc.json` 里显式写为 `false`**，发布上去直接就是免登录演示站：访客不用注册，进页面即用。这是有意选择而不是漏配，但它把域名变成了公共资源——任何人都能调 `/api/chat` 花掉你的大模型配额、`/api/config` 读写全部几家配置（Key 本身只回掩码，不回明文），全站数据共用同一账号，只剩 `THROTTLE_TTL/THROTTLE_LIMIT` 这一层 IP 限流。要按人隔离就把它改成 `true` 重新部署，登录页和账号隔离会原样回来。
-9. **`MODEL_ROUTING_CANDIDATES` 默认留空**，它现在只是**全局兜底**：优先用每份配置里的 `routingCandidates`，配置留空才回落到它。两者都空就是线上恒用配置里的主力模型。要按场景换档，更推荐直接在页面「模型档位候选」里填该账号**确实开通了的**同家模型 id（从低到高，如 `deepseek-flash,deepseek-v4-pro`）——填了没开通的名字会在请求上游时拿到 4xx，界面直接报后端翻译过的错误。开关暴露在 `GET /api/health`（`modelRouting`），它报的 `modelCandidates` 只有环境变量那一份兜底候选——每份配置自带的候选属于账号数据，未登录的健康检查不该看到别人的配置，要看就登录后 `GET /api/config` 的 `items[].routingCandidates`。健康检查还列出 `providers`（线上「这家接没接」不用重新发布）。
+9. **`MODEL_ROUTING_CANDIDATES` 默认留空**，它现在只是**全局兜底**：优先用每份配置里的 `routingCandidates`，配置留空才回落到它。两者都空就是线上恒用配置里的主力模型。要按场景换档，更推荐直接在页面「模型」下拉里勾上该账号**确实开通了的**同家模型（如 `deepseek-flash` 与 `deepseek-v4-pro`）——填了没开通的名字会在请求上游时拿到 4xx，界面直接报后端翻译过的错误。开关暴露在 `GET /api/health`（`modelRouting`），它报的 `modelCandidates` 只有环境变量那一份兜底候选——每份配置自带的候选属于账号数据，未登录的健康检查不该看到别人的配置，要看就登录后 `GET /api/config` 的 `items[].routingCandidates`。健康检查还列出 `providers`（线上「这家接没接」不用重新发布）。
 10. **`MEMORY_ENABLED` 默认开启**（只认字面 `false`）。开 Postgres 时记得先跑「生产库结构变更」里的建表语句：缺表不会让对话挂掉（读路径退化成「没有记忆」），但 `remember` 会一直失败，`/api/health` 的 `memoryTable` 会显示 `missing`。要临时停掉这个能力就设 `MEMORY_ENABLED=false`——模型不会再看到 `remember`/`forget`，也就不会许下它做不到的事。
 
 ### 部署命令

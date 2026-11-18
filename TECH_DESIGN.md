@@ -42,45 +42,45 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 
 关键约束：
 
-| 项 | 说明 |
-|----|------|
-| SSE 与函数超时 | 默认 5 秒会砍断流，必须 `timeout: 300`；响应头 `X-Accel-Buffering: no` 阻止网关缓冲 |
-| CORS 只能一层 | Nest `enableCors` 与网关安全域名会各加一份 ACAO；函数侧 `CORS_ORIGINS` 留空，只靠网关 |
-| 实例粘性 + `/tmp` | sqljs 下 config / 对话不跨实例共享；chat 先用 `ensureExists()` 补建对话规避 404，根治要切 postgres |
-| 限流 | `ThrottlerGuard` 计数在进程内存，实际放行量 ≈ limit × 实例数，需网关限频兜底 |
-| 摘要与多实例 | `contextSummary`/`summaryUntil` 跟着库走；sqljs 下冷启动会连同摘要一起丢失（切 postgres 根治），但不会造成“摘要覆盖不存在的消息”这类错乱 |
+| 项                | 说明                                                                                                                                     |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| SSE 与函数超时    | 默认 5 秒会砍断流，必须 `timeout: 300`；响应头 `X-Accel-Buffering: no` 阻止网关缓冲                                                      |
+| CORS 只能一层     | Nest `enableCors` 与网关安全域名会各加一份 ACAO；函数侧 `CORS_ORIGINS` 留空，只靠网关                                                    |
+| 实例粘性 + `/tmp` | sqljs 下 config / 对话不跨实例共享；chat 先用 `ensureExists()` 补建对话规避 404，根治要切 postgres                                       |
+| 限流              | `ThrottlerGuard` 计数在进程内存，实际放行量 ≈ limit × 实例数，需网关限频兜底                                                             |
+| 摘要与多实例      | `contextSummary`/`summaryUntil` 跟着库走；sqljs 下冷启动会连同摘要一起丢失（切 postgres 根治），但不会造成“摘要覆盖不存在的消息”这类错乱 |
 
 > 部署期操作约束（VPC 打通、控制台路径透传与安全域名、上线验收、sqljs 局限的根治步骤）统一写在 README「云端部署（腾讯云 CloudBase）」，此处不重复。
 
 ## 技术选型
 
-| 层面 | 选择 | 理由 |
-|------|------|------|
-| 前端框架 | React 19 + Vite 8 | 快速 HMR、生态成熟 |
-| 样式 | Tailwind CSS 4 | 原子化、无运行时开销 |
-| Markdown | react-markdown + remark-gfm | 支持 GFM 表格/任务列表/删除线 |
-| 代码高亮 | react-syntax-highlighter (Prism) | 按需加载、100+ 语言 |
-| 后端框架 | NestJS 11 | 模块化、DI、装饰器风格 |
-| ORM | TypeORM 0.3 | NestJS 官方推荐、装饰器实体 |
-| 数据库 | sql.js (SQLite in WASM) / PostgreSQL | 本地零配置演示；多实例云端必须共享库 |
-| 大模型 | DeepSeek | 官方 CORS 友好、兼容 OpenAI 协议、价格低 |
+| 层面     | 选择                                 | 理由                                     |
+| -------- | ------------------------------------ | ---------------------------------------- |
+| 前端框架 | React 19 + Vite 8                    | 快速 HMR、生态成熟                       |
+| 样式     | Tailwind CSS 4                       | 原子化、无运行时开销                     |
+| Markdown | react-markdown + remark-gfm          | 支持 GFM 表格/任务列表/删除线            |
+| 代码高亮 | react-syntax-highlighter (Prism)     | 按需加载、100+ 语言                      |
+| 后端框架 | NestJS 11                            | 模块化、DI、装饰器风格                   |
+| ORM      | TypeORM 0.3                          | NestJS 官方推荐、装饰器实体              |
+| 数据库   | sql.js (SQLite in WASM) / PostgreSQL | 本地零配置演示；多实例云端必须共享库     |
+| 大模型   | DeepSeek                             | 官方 CORS 友好、兼容 OpenAI 协议、价格低 |
 
 ## 数据模型
 
 ### ApiConfig（按账号每家一行，其中一份标记为「当前使用」）
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| id | uuid PK | 自动 |
-| userId | varchar(36), nullable | 归属账号。鉴权上线前的旧行是 NULL，由第一个注册账号认领 |
-| provider | varchar | 供应商标识，取值只能是 `providers.ts` 注册表里的 id（当前 `deepseek` / `zhipu`） |
-| active | boolean NOT NULL DEFAULT false | 生效指针。同一账号内同时最多一份为 `true`，由服务层在一个事务里挪动，**库里不加唯一约束**（部分唯一索引在 sqlite/postgres 方言写法不一致，且 sqljs 那侧未必认） |
-| apiKey | varchar(512) | AES-256-GCM 密文，格式 `gcm1:<iv-hex>:<tag-hex>:<cipher-b64>`；主密钥缺失时拒绝保存，不退化成明文 |
-| baseUrl | varchar | API 基地址，一律 https；是否允许带路径由该家的 `baseUrlRule` 决定（智谱的兼容端点必须带 `/api/paas/v4`） |
-| model | varchar | 主力模型名称 |
-| routingCandidates | varchar(512), nullable | 这一家的场景化档位候选（从低到高逗号分隔）。属于「这家有几档」而非「全局开关」，所以放在行上；留空才回落到 `MODEL_ROUTING_CANDIDATES` |
-| createdAt | datetime | 创建时间 |
-| updatedAt | datetime | 最后更新时间 |
+| 字段              | 类型                           | 说明                                                                                                                                                            |
+| ----------------- | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| id                | uuid PK                        | 自动                                                                                                                                                            |
+| userId            | varchar(36), nullable          | 归属账号。鉴权上线前的旧行是 NULL，由第一个注册账号认领                                                                                                         |
+| provider          | varchar                        | 供应商标识，取值只能是 `providers.ts` 注册表里的 id（当前 `deepseek` / `zhipu`）                                                                                |
+| active            | boolean NOT NULL DEFAULT false | 生效指针。同一账号内同时最多一份为 `true`，由服务层在一个事务里挪动，**库里不加唯一约束**（部分唯一索引在 sqlite/postgres 方言写法不一致，且 sqljs 那侧未必认） |
+| apiKey            | varchar(512)                   | AES-256-GCM 密文，格式 `gcm1:<iv-hex>:<tag-hex>:<cipher-b64>`；主密钥缺失时拒绝保存，不退化成明文                                                               |
+| baseUrl           | varchar                        | API 基地址，一律 https；是否允许带路径由该家的 `baseUrlRule` 决定（智谱的兼容端点必须带 `/api/paas/v4`）                                                        |
+| model             | varchar                        | 主力模型名称                                                                                                                                                    |
+| routingCandidates | varchar(512), nullable         | 这一家的场景化档位候选（从低到高逗号分隔）。属于「这家有几档」而非「全局开关」，所以放在行上；留空才回落到 `MODEL_ROUTING_CANDIDATES`                           |
+| createdAt         | datetime                       | 创建时间                                                                                                                                                        |
+| updatedAt         | datetime                       | 最后更新时间                                                                                                                                                    |
 
 **为什么从「每人 upsert 最近一条」改成一人多行**：接第二家时如果继续复用同一行，保存智谱就把 DeepSeek 的 Key 覆盖了，用户来回切供应商要来回重贴密钥，
 而免登录演示站上这等价于任何访客都能顶掉别人的凭据。`(userId, provider)` 复合唯一让「一人一家最多一份」，多份之间靠 `active` 指一个。
@@ -88,52 +88,52 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 
 ### User
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| id | uuid PK | 自动 |
-| username | varchar(32), unique index | 统一小写存储，注册/登录前先 `trim().toLowerCase()`，避免大小写变体各占一个账号 |
-| passwordHash | varchar(256) | `scrypt$N$r$p$salt$hash`，参数随散列一起存，日后调参不影响老口令校验 |
-| createdAt / updatedAt | datetime | 自动 |
+| 字段                  | 类型                      | 说明                                                                           |
+| --------------------- | ------------------------- | ------------------------------------------------------------------------------ |
+| id                    | uuid PK                   | 自动                                                                           |
+| username              | varchar(32), unique index | 统一小写存储，注册/登录前先 `trim().toLowerCase()`，避免大小写变体各占一个账号 |
+| passwordHash          | varchar(256)              | `scrypt$N$r$p$salt$hash`，参数随散列一起存，日后调参不影响老口令校验           |
+| createdAt / updatedAt | datetime                  | 自动                                                                           |
 
 口令用 Node 内置 `crypto.scrypt` 加盐散列（N=16384、r=8、p=1、16 字节随机盐、32 字节输出，约 16MB 内存，落在 Node 默认 maxmem 内）。校验前对输入做 NFKC 归一，避免同形字符导致“看着一样却登不进去”。明文口令既不落库也不写日志。
 
 ### Session
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| id | uuid PK | 自动 |
-| token | varchar(64), unique index | `randomBytes(32).toString('hex')`，前端存 localStorage 并以 `Authorization: Bearer` 发送 |
-| userId | varchar(36), index | 所属账号。用 varchar 而不是 uuid FK，兼容 sqljs 与 PostgreSQL 两边建表 |
-| expiresAt | datetime | 固定 30 天，不做滑动续期：续期要写库，等于每次请求都碰一次会话表 |
-| createdAt | datetime | 自动 |
+| 字段      | 类型                      | 说明                                                                                     |
+| --------- | ------------------------- | ---------------------------------------------------------------------------------------- |
+| id        | uuid PK                   | 自动                                                                                     |
+| token     | varchar(64), unique index | `randomBytes(32).toString('hex')`，前端存 localStorage 并以 `Authorization: Bearer` 发送 |
+| userId    | varchar(36), index        | 所属账号。用 varchar 而不是 uuid FK，兼容 sqljs 与 PostgreSQL 两边建表                   |
+| expiresAt | datetime                  | 固定 30 天，不做滑动续期：续期要写库，等于每次请求都碰一次会话表                         |
+| createdAt | datetime                  | 自动                                                                                     |
 
 过期会话在 `resolve()` 命中时顺手删除，不额外跑定时任务。
 
 ### Conversation
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| id | uuid PK | 自动 |
-| userId | varchar(36), nullable | 归属账号；所有读写都先过 `owned(userId, id)`，越权访问统一按 404 处理 |
-| title | varchar | 对话标题（自动取首条用户消息前 24 字） |
-| contextSummary | text, nullable | 滑出上下文窗口的旧轮次归并成的**滚动摘要**；存库里而不是每轮重算，否则对话越长压缩成本反超节省量 |
-| summaryUntil | bigint, nullable | 摘要已覆盖到的消息时间戳（含）。时间戳 ≤ 该值的消息视为“已在摘要里”，避免同一段对话既在摘要里又原文重发 |
-| createdAt | datetime | 创建时间 |
-| updatedAt | datetime | 最后更新时间 |
+| 字段           | 类型                  | 说明                                                                                                    |
+| -------------- | --------------------- | ------------------------------------------------------------------------------------------------------- |
+| id             | uuid PK               | 自动                                                                                                    |
+| userId         | varchar(36), nullable | 归属账号；所有读写都先过 `owned(userId, id)`，越权访问统一按 404 处理                                   |
+| title          | varchar               | 对话标题（自动取首条用户消息前 24 字）                                                                  |
+| contextSummary | text, nullable        | 滑出上下文窗口的旧轮次归并成的**滚动摘要**；存库里而不是每轮重算，否则对话越长压缩成本反超节省量        |
+| summaryUntil   | bigint, nullable      | 摘要已覆盖到的消息时间戳（含）。时间戳 ≤ 该值的消息视为“已在摘要里”，避免同一段对话既在摘要里又原文重发 |
+| createdAt      | datetime              | 创建时间                                                                                                |
+| updatedAt      | datetime              | 最后更新时间                                                                                            |
 
 > `contextSummary` / `summaryUntil` 只在服务端组装上下文时使用，不随 `GET /api/conversations/:id` 返回给前端；`truncateFrom` 在删除消息时若发现摘要已覆盖被删范围（`summaryUntil >= fromTimestamp`）会一并作废，避免摘要里残留根本不存在的对话。
 
 ### Message
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| id | uuid PK | 自动 |
-| role | varchar | 'user' 或 'assistant' |
-| content | text | 消息正文 |
-| toolCalls | text, nullable | Agent 工具轨迹 JSON（id/name/arguments/result/ok），仅 assistant 消息有值；既供前端展示步骤，也供多轮还原 tool_calls 上下文 |
-| model | varchar(128), nullable | 本轮**实际作答**的模型 id，仅 assistant 消息有值。开了模型路由后配置里的名字不再等于答案来源，界面与续传都读这一列；改动之前的历史数据为 `null`，续传时回退路由器 |
-| timestamp | bigint | 毫秒时间戳（前端排序用） |
-| conversation | FK → Conversation | 所属对话（CASCADE 删除） |
+| 字段         | 类型                   | 说明                                                                                                                                                              |
+| ------------ | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| id           | uuid PK                | 自动                                                                                                                                                              |
+| role         | varchar                | 'user' 或 'assistant'                                                                                                                                             |
+| content      | text                   | 消息正文                                                                                                                                                          |
+| toolCalls    | text, nullable         | Agent 工具轨迹 JSON（id/name/arguments/result/ok），仅 assistant 消息有值；既供前端展示步骤，也供多轮还原 tool_calls 上下文                                       |
+| model        | varchar(128), nullable | 本轮**实际作答**的模型 id，仅 assistant 消息有值。开了模型路由后配置里的名字不再等于答案来源，界面与续传都读这一列；改动之前的历史数据为 `null`，续传时回退路由器 |
+| timestamp    | bigint                 | 毫秒时间戳（前端排序用）                                                                                                                                          |
+| conversation | FK → Conversation      | 所属对话（CASCADE 删除）                                                                                                                                          |
 
 > 生产 Postgres 关着 `synchronize`，`migrationsRun` 又没有可跑的迁移目录，所以**改实体必须手动补列**，否则新字段会在第一次写库时炸：
 > `ALTER TABLE messages ADD COLUMN IF NOT EXISTS model varchar(128)`（可空；旧行留 `NULL`，续传遇到 `NULL` 回退路由器，不报错）。
@@ -142,15 +142,15 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 
 实体在 `functions/api/src/memory/memory.entity.ts`，表名 `user_memories`。它记的是「关于这位用户的稳定事实」，与 `Conversation.contextSummary` 是两套东西：摘要只活在一场对话里、会被窗口裁掉，记忆每次请求都重新注入。
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| id | uuid PK | 自动；给模型看的编号取它去连字符后的前 8 位（`memoryHandle()`），完整 uuid 太长且模型抄错一位就找不到 |
-| userId | varchar(36) | 归属账号，所有读写以它过滤，越权统一 404 |
-| content | text | 记忆正文；单条长度在**服务层**按 `MEMORY_ITEM_MAX_CHARS` 拦，不交给数据库 |
-| fingerprint | varchar(64) | 归一化（折叠空白 + 转小写）后的 sha256。存哈希而非归一化正文：长度可控，且「同一句话大小写不同」不该记两遍 |
-| source | varchar(16) | `model`=模型在对话里自主记录，`user`=用户在面板里亲手写；联合类型列必须显式写 `type` |
-| conversationId | varchar(36), nullable | 只记录「在哪次对话里记下的」，供界面说明来处；检索与注入一律按账号，不建外键（删会话不该顺带删掉记忆） |
-| createdAt / updatedAt | datetime | 排序、注入取舍与条数淘汰都只看 `updatedAt` |
+| 字段                  | 类型                  | 说明                                                                                                       |
+| --------------------- | --------------------- | ---------------------------------------------------------------------------------------------------------- |
+| id                    | uuid PK               | 自动；给模型看的编号取它去连字符后的前 8 位（`memoryHandle()`），完整 uuid 太长且模型抄错一位就找不到      |
+| userId                | varchar(36)           | 归属账号，所有读写以它过滤，越权统一 404                                                                   |
+| content               | text                  | 记忆正文；单条长度在**服务层**按 `MEMORY_ITEM_MAX_CHARS` 拦，不交给数据库                                  |
+| fingerprint           | varchar(64)           | 归一化（折叠空白 + 转小写）后的 sha256。存哈希而非归一化正文：长度可控，且「同一句话大小写不同」不该记两遍 |
+| source                | varchar(16)           | `model`=模型在对话里自主记录，`user`=用户在面板里亲手写；联合类型列必须显式写 `type`                       |
+| conversationId        | varchar(36), nullable | 只记录「在哪次对话里记下的」，供界面说明来处；检索与注入一律按账号，不建外键（删会话不该顺带删掉记忆）     |
+| createdAt / updatedAt | datetime              | 排序、注入取舍与条数淘汰都只看 `updatedAt`                                                                 |
 
 索引两条：`(userId, updatedAt)` 供列表与注入排序，`(userId, fingerprint)` **唯一**——去重压在数据库层，应用层再写一套判断就会有两份口径。
 
@@ -162,24 +162,24 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 
 实体在 `functions/api/src/tasks/task.entity.ts`，表名 `tasks`。它是**请求侧与执行侧共用的唯一交接面**：接口只写状态，执行器只按状态领取。
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| id | uuid PK | 自动 |
-| userId | varchar(36), indexed | 归属账号；所有读写过 `owned(userId, id)`，越权统一 404 |
-| conversationId | varchar(36), nullable | 可选关联会话，仅用于把任务归到某段对话下，不建立外键（删会话不该顺带删掉正在跑的任务） |
-| kind | varchar(64) | 任务类型，取值来自 `task-registry.ts`；当前只有 `tool_call` |
-| status | varchar(16) | `queued` / `running` / `succeeded` / `failed` / `canceled` |
-| payload | text | 该 kind 的参数 JSON 文本，入队前按 kind 的 `resolve()` 校验过 |
-| result | text, nullable | 执行结果文本，落库前按 `TASK_RESULT_MAX_CHARS` 截断并留标记 |
-| error | text, nullable | 失败原因或「用户已取消」 |
-| progress | int | 0–100，为将来的分步任务预留；当前工具型任务只在完成时置 100 |
-| attempts | int | 已尝试次数，领取时 +1，超过 `TASK_MAX_ATTEMPTS` 判失败 |
-| dedupeKey | varchar(64), nullable | 幂等键，与 `userId` 组成**唯一索引**；同键重复提交返回既有任务 |
-| runnerId | varchar(64), nullable | 当前持有者（执行器实例标识），仅用于排查 |
-| leaseUntil | bigint, nullable | 租约到期毫秒时间戳；`running` 且它已过期 = 持有者大概死了，可被别的实例回收 |
-| notBefore | bigint, nullable | 退避门：早于此刻不可领取，避免失败后忙等重投 |
-| startedAt / finishedAt | bigint, nullable | 毫秒时间戳 |
-| createdAt / updatedAt | datetime | 列表排序依据 |
+| 字段                   | 类型                  | 说明                                                                                   |
+| ---------------------- | --------------------- | -------------------------------------------------------------------------------------- |
+| id                     | uuid PK               | 自动                                                                                   |
+| userId                 | varchar(36), indexed  | 归属账号；所有读写过 `owned(userId, id)`，越权统一 404                                 |
+| conversationId         | varchar(36), nullable | 可选关联会话，仅用于把任务归到某段对话下，不建立外键（删会话不该顺带删掉正在跑的任务） |
+| kind                   | varchar(64)           | 任务类型，取值来自 `task-registry.ts`；当前只有 `tool_call`                            |
+| status                 | varchar(16)           | `queued` / `running` / `succeeded` / `failed` / `canceled`                             |
+| payload                | text                  | 该 kind 的参数 JSON 文本，入队前按 kind 的 `resolve()` 校验过                          |
+| result                 | text, nullable        | 执行结果文本，落库前按 `TASK_RESULT_MAX_CHARS` 截断并留标记                            |
+| error                  | text, nullable        | 失败原因或「用户已取消」                                                               |
+| progress               | int                   | 0–100，为将来的分步任务预留；当前工具型任务只在完成时置 100                            |
+| attempts               | int                   | 已尝试次数，领取时 +1，超过 `TASK_MAX_ATTEMPTS` 判失败                                 |
+| dedupeKey              | varchar(64), nullable | 幂等键，与 `userId` 组成**唯一索引**；同键重复提交返回既有任务                         |
+| runnerId               | varchar(64), nullable | 当前持有者（执行器实例标识），仅用于排查                                               |
+| leaseUntil             | bigint, nullable      | 租约到期毫秒时间戳；`running` 且它已过期 = 持有者大概死了，可被别的实例回收            |
+| notBefore              | bigint, nullable      | 退避门：早于此刻不可领取，避免失败后忙等重投                                           |
+| startedAt / finishedAt | bigint, nullable      | 毫秒时间戳                                                                             |
+| createdAt / updatedAt  | datetime              | 列表排序依据                                                                           |
 
 > 时间字段一律用 bigint 毫秒而不是 datetime：`sqljs` 与 `postgres` 对日期列的序列化行为不同，跨驱动比较容易写错；毫秒整数两边同形，也和 `Message.timestamp` 保持一套坐标系。
 
@@ -187,13 +187,13 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 
 ### 认证
 
-| Method | Path | 请求体 | 响应 |
-|--------|------|--------|------|
-| POST | `/api/auth/register` | `{ username, password }` | `{ token, user: { id, username } }`，注册成功即登录 |
-| POST | `/api/auth/login` | `{ username, password }` | 同上；用户名或密码错误统一返回 401「用户名或密码不正确」 |
-| POST | `/api/auth/logout` | — | `{ success: true }`，删除当前 token 对应的会话 |
-| GET | `/api/auth/me` | — | `{ id, username }`；无 token 时 401，免登录时直接返回演示身份 |
-| GET | `/api/auth/mode` | — | `{ authEnabled, user }`：真实登录时 `{ true, null }`，免登录时 `{ false, 演示身份 }`。前端首屏靠它决定渲染登录页还是主界面 |
+| Method | Path                 | 请求体                   | 响应                                                                                                                       |
+| ------ | -------------------- | ------------------------ | -------------------------------------------------------------------------------------------------------------------------- |
+| POST   | `/api/auth/register` | `{ username, password }` | `{ token, user: { id, username } }`，注册成功即登录                                                                        |
+| POST   | `/api/auth/login`    | `{ username, password }` | 同上；用户名或密码错误统一返回 401「用户名或密码不正确」                                                                   |
+| POST   | `/api/auth/logout`   | —                        | `{ success: true }`，删除当前 token 对应的会话                                                                             |
+| GET    | `/api/auth/me`       | —                        | `{ id, username }`；无 token 时 401，免登录时直接返回演示身份                                                              |
+| GET    | `/api/auth/mode`     | —                        | `{ authEnabled, user }`：真实登录时 `{ true, null }`，免登录时 `{ false, 演示身份 }`。前端首屏靠它决定渲染登录页还是主界面 |
 
 `register` / `login` / `mode` / `health` 用 `@Public()` 放行，其余接口由全局 `AuthGuard` 解析 `Authorization: Bearer <token>`，
 把用户挂到 `request.user` 供控制器 `@CurrentUser()` 取用；token 缺失返回 401「请先登录」，
@@ -208,9 +208,9 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 
 ### 健康检查
 
-| Method | Path | 响应 |
-|--------|------|------|
-| GET | `/api/health` | `{ status, database: up/down, encryption: enabled/disabled, promptVersion, auth: enabled/disabled, background: enabled/disabled, modelRouting: enabled/disabled, modelCandidates: []（仅环境变量兜底那一份）, providers: []（注册表里的供应商 id）, memory: enabled/disabled, memoryTable: disabled/up/missing, memoryLimits: { maxEntries, itemMaxChars, injectMaxChars }, tasks: { queued, running }, uptime, timestamp }`；数据库探测失败返回 503 |
+| Method | Path          | 响应                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ------ | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| GET    | `/api/health` | `{ status, database: up/down, encryption: enabled/disabled, promptVersion, auth: enabled/disabled, background: enabled/disabled, modelRouting: enabled/disabled, modelCandidates: []（仅环境变量兜底那一份）, providers: []（注册表里的供应商 id）, memory: enabled/disabled, memoryTable: disabled/up/missing, memoryLimits: { maxEntries, itemMaxChars, injectMaxChars }, tasks: { queued, running }, uptime, timestamp }`；数据库探测失败返回 503 |
 
 全局：所有接口受 `ThrottlerGuard` 按 IP 限流（`THROTTLE_TTL` / `THROTTLE_LIMIT`），仅 `NODE_ENV=production` 生效——本地开发 StrictMode 双发请求会很快撞上限流。
 
@@ -218,38 +218,38 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 
 一个账号可以保存多份配置（每家一份），下面这组接口描述的就是「列表 + 生效指针」，前端不自己推断哪份该显示成「当前使用」。
 
-| Method | Path | 请求体 | 响应 |
-|--------|------|--------|------|
-| GET | `/api/config` | — | `{ configured, active, items }`：`items[]` 为每份配置的视图（`provider` / `label` / `baseUrl` / `model` / `apiKeyMasked` / `active` / `routingCandidates` / `updatedAt`），`active` 是其中 `active=true` 的那一份或 `null`；`configured` 等价于 `active !== null` |
-| POST | `/api/config` | `{ provider, apiKey, baseUrl, model, routingCandidates?, apply? }` | `{ success, config }`。`apiKey` 留空或仍是掩码＝沿用库里那把（首次保存该家除外）；`apply` 缺省 `true` 才把生效位挪过来 |
-| POST | `/api/config/:provider/activate` | — | `{ success, config }`；该家没配过则报错 |
-| DELETE | `/api/config/:provider` | — | `{ success: true }`；删掉的正是生效那份时，剩下 `updatedAt` 最近的一份自动顶上 |
-| DELETE | `/api/config` | — | `{ success: true }`，清空该账号的全部配置 |
+| Method | Path                             | 请求体                                                             | 响应                                                                                                                                                                                                                                                              |
+| ------ | -------------------------------- | ------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| GET    | `/api/config`                    | —                                                                  | `{ configured, active, items }`：`items[]` 为每份配置的视图（`provider` / `label` / `baseUrl` / `model` / `apiKeyMasked` / `active` / `routingCandidates` / `updatedAt`），`active` 是其中 `active=true` 的那一份或 `null`；`configured` 等价于 `active !== null` |
+| POST   | `/api/config`                    | `{ provider, apiKey, baseUrl, model, routingCandidates?, apply? }` | `{ success, config }`。`apiKey` 留空或仍是掩码＝沿用库里那把（首次保存该家除外）；`apply` 缺省 `true` 才把生效位挪过来                                                                                                                                            |
+| POST   | `/api/config/:provider/activate` | —                                                                  | `{ success, config }`；该家没配过则报错                                                                                                                                                                                                                           |
+| DELETE | `/api/config/:provider`          | —                                                                  | `{ success: true }`；删掉的正是生效那份时，剩下 `updatedAt` 最近的一份自动顶上                                                                                                                                                                                    |
+| DELETE | `/api/config`                    | —                                                                  | `{ success: true }`，清空该账号的全部配置                                                                                                                                                                                                                         |
 
 所有响应只回掩码，明文 Key 不出后端；`provider` 不在注册表内、Key 不符合该家形态、baseUrl 非 https 或候选跨家，都在 DTO 层拒掉并回中文说明。
 
 ### 对话管理
 
-| Method | Path | 说明 |
-|--------|------|------|
-| GET | `/api/conversations` | 列表（createdAt DESC，不含 messages） |
-| POST | `/api/conversations` | 新建，返回含 id 的完整对象 |
-| GET | `/api/conversations/:id` | 含完整 messages（timestamp ASC） |
-| PATCH | `/api/conversations/:id` | 更新 title |
-| DELETE | `/api/conversations/:id` | 级联删除所有 messages |
-| POST | `/api/conversations/:id/truncate` | 请求体 `{ fromTimestamp }`，删除 `timestamp >= fromTimestamp` 的消息，返回 `{ removed, summaryReset }`。“重新生成”与“编辑重发”共用此入口；按时间戳而非消息 id 删除，与前端列表以 timestamp 为 key 保持同一套坐标系 |
+| Method | Path                              | 说明                                                                                                                                                                                                               |
+| ------ | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| GET    | `/api/conversations`              | 列表（createdAt DESC，不含 messages）                                                                                                                                                                              |
+| POST   | `/api/conversations`              | 新建，返回含 id 的完整对象                                                                                                                                                                                         |
+| GET    | `/api/conversations/:id`          | 含完整 messages（timestamp ASC）                                                                                                                                                                                   |
+| PATCH  | `/api/conversations/:id`          | 更新 title                                                                                                                                                                                                         |
+| DELETE | `/api/conversations/:id`          | 级联删除所有 messages                                                                                                                                                                                              |
+| POST   | `/api/conversations/:id/truncate` | 请求体 `{ fromTimestamp }`，删除 `timestamp >= fromTimestamp` 的消息，返回 `{ removed, summaryReset }`。“重新生成”与“编辑重发”共用此入口；按时间戳而非消息 id 删除，与前端列表以 timestamp 为 key 保持同一套坐标系 |
 
 ### 后台任务
 
 控制器 `functions/api/src/tasks/tasks.controller.ts`。`meta/kinds` 必须**先于 `:id` 声明**，否则 `meta/kinds` 会被当成任务 id 落到详情接口。
 
-| Method | Path | 请求 | 响应 |
-|--------|------|------|------|
-| GET | `/api/tasks/meta/kinds` | — | `{ kinds: [{ kind, description, fields: [{ name, type, required, description, enum? }] }], runnerEnabled }`；前端表单与说明直接照此渲染，新增 kind 不用改前端 |
-| GET | `/api/tasks` | query `status?`、`conversationId?` | `{ items, counts: { queued, running }, runnerEnabled }`，按 `createdAt DESC`，最多 100 条（`LIST_LIMIT`） |
-| POST | `/api/tasks` | `{ kind, payload, conversationId?, dedupeKey? }` | 任务实体；`kind` 未知、`payload` 解析不过、超过 `TASK_PAYLOAD_MAX_BYTES` 均返回 400 且消息带可用清单 |
-| GET | `/api/tasks/:id` | — | 任务实体；不存在或不属于当前账号统一 404 |
-| POST | `/api/tasks/:id/cancel` | — | 置 `canceled`、清 `leaseUntil`、`error` 缺省填「用户已取消」；已是终态返回 400 |
+| Method | Path                    | 请求                                             | 响应                                                                                                                                                          |
+| ------ | ----------------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| GET    | `/api/tasks/meta/kinds` | —                                                | `{ kinds: [{ kind, description, fields: [{ name, type, required, description, enum? }] }], runnerEnabled }`；前端表单与说明直接照此渲染，新增 kind 不用改前端 |
+| GET    | `/api/tasks`            | query `status?`、`conversationId?`               | `{ items, counts: { queued, running }, runnerEnabled }`，按 `createdAt DESC`，最多 100 条（`LIST_LIMIT`）                                                     |
+| POST   | `/api/tasks`            | `{ kind, payload, conversationId?, dedupeKey? }` | 任务实体；`kind` 未知、`payload` 解析不过、超过 `TASK_PAYLOAD_MAX_BYTES` 均返回 400 且消息带可用清单                                                          |
+| GET    | `/api/tasks/:id`        | —                                                | 任务实体；不存在或不属于当前账号统一 404                                                                                                                      |
+| POST   | `/api/tasks/:id/cancel` | —                                                | 置 `canceled`、清 `leaseUntil`、`error` 缺省填「用户已取消」；已是终态返回 400                                                                                |
 
 - `dedupeKey` 幂等：命中 `(userId, dedupeKey)` 已有任务时直接返回既有那条；并发撞唯一索引也走“读回已存在”，不会造出两条
 - `payload` 的内部形状**不过全局 `ValidationPipe` 的 whitelist**（它只裁剪 DTO 自身属性），因此未知顶层属性会被 400 拒掉，而 `payload` 内的键交给 kind 的 `resolve()` 判定
@@ -260,22 +260,23 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 `POST /api/chat`
 
 请求体：
+
 ```json
 { "conversationId": "uuid", "content": "用户输入" }
 ```
 
 响应：SSE 流，每帧一个 JSON 对象（`data: {...}\n\n`）
 
-| 事件 | 载荷 | 说明 |
-|------|------|------|
-| 正文 | `{"content":"你"}` | 逐字增量，前端拼到当前气泡 |
-| 工具开始 | `{"tool":{"id","name","args","status":"calling"}}` | 模型决定调用工具；**同一轮的多个调用会先全部发出再并发执行**，展示顺序与执行完成顺序无关 |
+| 事件     | 载荷                                                                     | 说明                                                                                                                                    |
+| -------- | ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
+| 正文     | `{"content":"你"}`                                                       | 逐字增量，前端拼到当前气泡                                                                                                              |
+| 工具开始 | `{"tool":{"id","name","args","status":"calling"}}`                       | 模型决定调用工具；**同一轮的多个调用会先全部发出再并发执行**，展示顺序与执行完成顺序无关                                                |
 | 工具增量 | `{"tool":{"id","name","status":"streaming","delta":"…","progress":{…}}}` | 只在执行期出现，`delta` 与 `progress` **可以同时有、也可以只有其一**（纯阶段事件序列化后连 `delta` 键都不存在）；见「工具结果流式推送」 |
-| 工具结束 | `{"tool":{"id","name","args","result","ok","status":"done\|error"}}` | 结果按 `tool_calls` 原顺序回填；终态带**完整** `result`，前端据此覆盖已累加的 `delta` |
-| 提示 | `{"notice":"…被截断…"}` | 非致命提示（如输出撞长度上限） |
-| 模型 | `{"model":{"id":"deepseek-flash","reason":"…","score":0.56}}` | 每轮开头发一次，说明**这条回答实际由哪个模型作答、为什么选它**；路由关闭时 `id` 就是配置里的主力模型、`score` 恒为 0 |
-| 错误 | `{"error":"具体错误信息","retryable":true}` | 上游 4xx/5xx、轮数耗尽、网络异常；`retryable` 决定前端能不能拿已生成内容续传 |
-| 结束 | `data: [DONE]` | 流终止信号 |
+| 工具结束 | `{"tool":{"id","name","args","result","ok","status":"done\|error"}}`     | 结果按 `tool_calls` 原顺序回填；终态带**完整** `result`，前端据此覆盖已累加的 `delta`                                                   |
+| 提示     | `{"notice":"…被截断…"}`                                                  | 非致命提示（如输出撞长度上限）                                                                                                          |
+| 模型     | `{"model":{"id":"deepseek-flash","reason":"…","score":0.56}}`            | 每轮开头发一次，说明**这条回答实际由哪个模型作答、为什么选它**；路由关闭时 `id` 就是配置里的主力模型、`score` 恒为 0                    |
+| 错误     | `{"error":"具体错误信息","retryable":true}`                              | 上游 4xx/5xx、轮数耗尽、网络异常；`retryable` 决定前端能不能拿已生成内容续传                                                            |
+| 结束     | `data: [DONE]`                                                           | 流终止信号                                                                                                                              |
 
 事件体不在循环里现拼，统一由 `chat/sse-events.ts` 的三个组装函数产出（[sse-events.ts:31](file:///D:/MyProject/ai-chat-gitee/functions/api/src/chat/sse-events.ts#L31)）：这是前后端的接口契约，散着写没人能保证每个事件都带 `id`——漏一次，并发执行的几个工具就把进度画到同一张卡上；抽成纯函数后评测也能在不启动服务的前提下断言这条契约。
 
@@ -284,8 +285,13 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 `POST /api/chat/resume`
 
 请求体：
+
 ```json
-{ "conversationId": "uuid", "content": "本轮原始提问", "partial": "浏览器已渲染的前半段回答" }
+{
+  "conversationId": "uuid",
+  "content": "本轮原始提问",
+  "partial": "浏览器已渲染的前半段回答"
+}
 ```
 
 响应与 `POST /api/chat` 完全同构，但**只推后半段增量**——前半段浏览器已经有了，重发一遍等于让用户看见两遍。
@@ -296,17 +302,17 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 
 定义在 `functions/api/src/chat/continuation.ts`（纯函数，可直接进离线评测），服务端编排在 `chat.service.ts` 的 `resumeChat()`，首发与续传共用同一个 `runTurn()`。
 
-| 环节 | 做法 | 为什么这样选 |
-|------|------|------|
-| 进度由谁携带 | **浏览器**把它已收到的文本原样带回，服务端不在内存里留「进行中」状态 | 云函数按连接调度实例，重连就是一条新连接，落到哪个实例不由我们决定，上个实例内存里的东西说没就没；浏览器手上那段反而是唯一稳定的进度 |
-| 上游怎么「继续」 | 把 `partial` 当作 `assistant` 前缀重新发一次，让模型顺着写 | Chat Completions 没有「从第 N 个 token 继续」的语义。代价说清楚：续传是一次全新请求、会重新计入一遍上下文 token，换回来的是不必从头重答、已生成部分不重复产出 |
-| 半截回答的去留 | 续传前 `dropPartialTail()` 撤掉中断那轮的半截记录，收尾时写回 `partial + 新增` 一条 | 不撤就会和续传后的完整回答并成两条；撤的条件是「末条 assistant 的内容正好是本次 partial 的前缀」，与本轮无关的既有回答一律不动 |
-| 提问缺失时 | 历史里没有这条提问就临时补一份，**不入库** | sqljs 每实例一份 `/tmp` 库，重连很可能落到从没写过这条提问的实例上；补进去的那份若入库，回到原实例就会看到同一句话两遍 |
-| 中断那轮的工具轨迹 | `mergeToolSteps()` 按 `id` 去重后接在新步骤前面 | 它们真的执行过、结果真的被用掉了，丢掉等于把已经花掉的成本从界面和下一轮上下文里抹掉 |
-| 什么错误才自动重连 | `retryableForStatus()`：408 / 429 / 5xx 可续，其余 4xx 不可续；传输层异常一律可续 | 4xx（除限流/超时）是请求本身的问题——Key 失效、模型名写错——重连只会再烧一次额度并把同一个错误复述三遍 |
-| 断线检测挂哪 | 挂 **`res` 的 `close`**，并用 `writableEnded` 区分「正常写完」与「半路被关」 | 挂 `req` 上没用：Node 在请求体读完时就发出 `req` 的 `close`，那时回答还没开始生成，控制器挂监听时事件早已过去，等于永远检测不到断线，服务端会闷头把整段跑完再落库（既继续烧额度，又让续传无从谈起） |
-| 续传用哪个模型 | 沿用中断那轮落库的 `messages.model`（仍需在候选白名单内），否则回退路由器 | 上游没有「接着上一个模型继续写」的语义，换模型续写会让前后半段风格断裂甚至自相矛盾，而浏览器手上只有文本、看不出问题出在模型换了。库里为 `null` 的旧数据（这列加之前落库的）也走回退 |
-| 前端重试节奏 | 最多 3 次，退避 `1200ms × 次数`，每次先等 `online` 事件（上限 15s） | 断网时立刻重试只会连着失败三轮；线性退避让「短暂抖动」和「真断了」在体验上区分开，耗尽后保留半截回答并提示改用「重新生成」 |
+| 环节               | 做法                                                                                | 为什么这样选                                                                                                                                                                                        |
+| ------------------ | ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 进度由谁携带       | **浏览器**把它已收到的文本原样带回，服务端不在内存里留「进行中」状态                | 云函数按连接调度实例，重连就是一条新连接，落到哪个实例不由我们决定，上个实例内存里的东西说没就没；浏览器手上那段反而是唯一稳定的进度                                                                |
+| 上游怎么「继续」   | 把 `partial` 当作 `assistant` 前缀重新发一次，让模型顺着写                          | Chat Completions 没有「从第 N 个 token 继续」的语义。代价说清楚：续传是一次全新请求、会重新计入一遍上下文 token，换回来的是不必从头重答、已生成部分不重复产出                                       |
+| 半截回答的去留     | 续传前 `dropPartialTail()` 撤掉中断那轮的半截记录，收尾时写回 `partial + 新增` 一条 | 不撤就会和续传后的完整回答并成两条；撤的条件是「末条 assistant 的内容正好是本次 partial 的前缀」，与本轮无关的既有回答一律不动                                                                      |
+| 提问缺失时         | 历史里没有这条提问就临时补一份，**不入库**                                          | sqljs 每实例一份 `/tmp` 库，重连很可能落到从没写过这条提问的实例上；补进去的那份若入库，回到原实例就会看到同一句话两遍                                                                              |
+| 中断那轮的工具轨迹 | `mergeToolSteps()` 按 `id` 去重后接在新步骤前面                                     | 它们真的执行过、结果真的被用掉了，丢掉等于把已经花掉的成本从界面和下一轮上下文里抹掉                                                                                                                |
+| 什么错误才自动重连 | `retryableForStatus()`：408 / 429 / 5xx 可续，其余 4xx 不可续；传输层异常一律可续   | 4xx（除限流/超时）是请求本身的问题——Key 失效、模型名写错——重连只会再烧一次额度并把同一个错误复述三遍                                                                                                |
+| 断线检测挂哪       | 挂 **`res` 的 `close`**，并用 `writableEnded` 区分「正常写完」与「半路被关」        | 挂 `req` 上没用：Node 在请求体读完时就发出 `req` 的 `close`，那时回答还没开始生成，控制器挂监听时事件早已过去，等于永远检测不到断线，服务端会闷头把整段跑完再落库（既继续烧额度，又让续传无从谈起） |
+| 续传用哪个模型     | 沿用中断那轮落库的 `messages.model`（仍需在候选白名单内），否则回退路由器           | 上游没有「接着上一个模型继续写」的语义，换模型续写会让前后半段风格断裂甚至自相矛盾，而浏览器手上只有文本、看不出问题出在模型换了。库里为 `null` 的旧数据（这列加之前落库的）也走回退                |
+| 前端重试节奏       | 最多 3 次，退避 `1200ms × 次数`，每次先等 `online` 事件（上限 15s）                 | 断网时立刻重试只会连着失败三轮；线性退避让「短暂抖动」和「真断了」在体验上区分开，耗尽后保留半截回答并提示改用「重新生成」                                                                          |
 
 ## 核心流程
 
@@ -330,18 +336,20 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 ### 场景化模型选择
 
 定义在 `functions/api/src/chat/model-router.ts`（纯函数，可直接进离线评测），服务端编排只在 `chat.service.ts` 里调一次 `pickModel()`。
-目标是**同一份配置内的几档模型按本轮问题挑一档**：不新增供应商、不改协议，前端只在配置弹窗里多一个候选输入框。
+目标是**同一份配置内的几档模型按本轮问题挑一档**：不新增供应商、不改协议，前端只在配置弹窗里把模型改成可多选的下拉。
 
-| 环节 | 做法 | 为什么这样选 |
-|------|------|------|
-| 候选从哪来 | 先取生效配置的 `api_config.routingCandidates`（**按档位从低到高**逗号分隔），留空才回落到 `MODEL_ROUTING_CANDIDATES`；两者都空即整层关闭 | 候选名属于某一家：把 `deepseek-v4-pro` 挂在环境变量上，切到智谱后这一档就会发给它的网关拿 4xx，而界面只看得见「答不上来」。所以归属做成「每份配置自带 + 全局兜底」，DTO 层再按该家的 `modelHint` 拒掉跨家候选。模型名不写死在代码里：供应商的 id 会换，用户也未必开通了高那一档。配了不存在的名字会在上游拿到 4xx，宁可让配置者自己负责，也不在代码里替它兜底 |
-| 谁来判定 | 服务端算复杂度分，而不是让模型自选 | 做成模型自选要多加一个「换模型再答一遍」的工具：多一跳、双份 token、失败难归因，还会白吃掉 `AGENT_MAX_TURNS` 的轮数预算。而这里的信号（长度、是否含代码、是否要推理）本来确定可得 |
-| 判定信号 | 长度分档（≤40/≤200/≤800/更长 → 0/0.1/0.22/0.34）+ 四类关键词权重（要求深入 0.34、分析设计类 0.22、含代码 0.26、格式要求 0.12），求和封顶 1 | 「仔细/深入」这类显式要求权重最高，不该被长度压过去；封顶是为了信号叠满也不越过最高档，否则多候选时永远用最贵的 |
-| 落档 | `index = min(候选数-1, floor(score × 候选数))` | 线性映射，加第三档不用改逻辑；`min` 保证越界也只会落在最高档而不是掉出白名单 |
-| 生效范围 | 每轮请求算一次，本轮所有工具迭代沿用同一个模型 | 一次回答中途换模型，工具前后的口径会不一致；决策成本也就一次正则匹配 |
-| 界面可见 | 流开头下发 `model` 事件（id/reason/score），顶栏显示最近一条回答的模型，气泡标注该条模型并把理由放悬停 | 配置里那个主力模型名不再等于答案来源。不说清「刚才是谁答的、为什么」，用户只会觉得同一句话有时快有时慢 |
-| 落库 | 写进 `messages.model`，续传时优先沿用 | 见「断线续传」表里那一行：换模型续写会让前后半段自相矛盾 |
-| 关掉的方式 | `MODEL_ROUTING_ENABLED=false` 或候选留空 | 留一个能一键回到「恒用主力模型」的口子，对比测试和排障都靠它，不必回滚代码 |
+「档位」是服务端内部口径：界面上用户只勾选要用的模型（不出现「第几档」），浏览器按供应商预设「从省到强」的顺序把勾选结果落成 `routingCandidates`，最后一档同时写入 `model` 作为无候选时的主力。
+
+| 环节       | 做法                                                                                                                                       | 为什么这样选                                                                                                                                                                                                                                                                                                                                                  |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 候选从哪来 | 先取生效配置的 `api_config.routingCandidates`（**按档位从低到高**逗号分隔），留空才回落到 `MODEL_ROUTING_CANDIDATES`；两者都空即整层关闭   | 候选名属于某一家：把 `deepseek-v4-pro` 挂在环境变量上，切到智谱后这一档就会发给它的网关拿 4xx，而界面只看得见「答不上来」。所以归属做成「每份配置自带 + 全局兜底」，DTO 层再按该家的 `modelHint` 拒掉跨家候选。模型名不写死在代码里：供应商的 id 会换，用户也未必开通了高那一档。配了不存在的名字会在上游拿到 4xx，宁可让配置者自己负责，也不在代码里替它兜底 |
+| 谁来判定   | 服务端算复杂度分，而不是让模型自选                                                                                                         | 做成模型自选要多加一个「换模型再答一遍」的工具：多一跳、双份 token、失败难归因，还会白吃掉 `AGENT_MAX_TURNS` 的轮数预算。而这里的信号（长度、是否含代码、是否要推理）本来确定可得                                                                                                                                                                             |
+| 判定信号   | 长度分档（≤40/≤200/≤800/更长 → 0/0.1/0.22/0.34）+ 四类关键词权重（要求深入 0.34、分析设计类 0.22、含代码 0.26、格式要求 0.12），求和封顶 1 | 「仔细/深入」这类显式要求权重最高，不该被长度压过去；封顶是为了信号叠满也不越过最高档，否则多候选时永远用最贵的                                                                                                                                                                                                                                               |
+| 落档       | `index = min(候选数-1, floor(score × 候选数))`                                                                                             | 线性映射，加第三档不用改逻辑；`min` 保证越界也只会落在最高档而不是掉出白名单                                                                                                                                                                                                                                                                                  |
+| 生效范围   | 每轮请求算一次，本轮所有工具迭代沿用同一个模型                                                                                             | 一次回答中途换模型，工具前后的口径会不一致；决策成本也就一次正则匹配                                                                                                                                                                                                                                                                                          |
+| 界面可见   | 流开头下发 `model` 事件（id/reason/score），顶栏显示最近一条回答的模型，气泡标注该条模型并把理由放悬停                                     | 配置里那个主力模型名不再等于答案来源。不说清「刚才是谁答的、为什么」，用户只会觉得同一句话有时快有时慢                                                                                                                                                                                                                                                        |
+| 落库       | 写进 `messages.model`，续传时优先沿用                                                                                                      | 见「断线续传」表里那一行：换模型续写会让前后半段自相矛盾                                                                                                                                                                                                                                                                                                      |
+| 关掉的方式 | `MODEL_ROUTING_ENABLED=false` 或候选留空                                                                                                   | 留一个能一键回到「恒用主力模型」的口子，对比测试和排障都靠它，不必回滚代码                                                                                                                                                                                                                                                                                    |
 
 环境变量：`MODEL_ROUTING_CANDIDATES`（默认空，只作配置未填时的兜底）、`MODEL_ROUTING_ENABLED`（默认 `true`，仅在最终候选非空时有意义）。
 `GET /api/health` 报的 `modelRouting` 是总开关、`modelCandidates` 是环境变量那一份兜底候选——每份配置自带的候选属于账号数据，未登录的健康检查不该看到别人的配置，登录后看 `GET /api/config` 的 `items[].routingCandidates`。
@@ -350,13 +358,13 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 
 定义在 `functions/api/src/chat/`：`token-estimator.ts`（估算+裁剪）、`context-summarizer.ts`（压缩）、`llm-client.ts`（非流式内部调用）。
 
-| 环节 | 做法 | 为什么这样选 |
-|------|------|------|
-| token 估算 | CJK 1 字/token、其他 4 字符/token、每条消息 +4、工具轨迹按 JSON 原文计入 | 不装 tiktoken/gpt-tokenizer：DeepSeek 分词器与 cl100k 并不一致，装一个“精确到别的模型”的库反而给人虚假安全感；这里只需决定“丢多少轮”，±20% 误差只影响窗口边界一两轮 |
-| 滑窗 | `planWindow(messages, budget)` 从最新往回累加，超出即停 | **最新一条无条件保留**：丢了它本轮请求就没有用户问题，比撞上限更糟 |
-| 摘要 | `SUMMARY_PROMPT` + `completeOnce()` 非流式调用，失败退回抽取式 `extractiveDigest` | 摘要边界 `summaryUntil` 随裁剪一起推进，同一段旧对话不会被反复压缩，也不会既在摘要里又原文重发 |
-| 工具轨迹 | 不进摘要（它的结论已体现在 assistant 正文里） | 重复计入只会推高压缩成本 |
-| 成本控制 | 摘要正文自身也要吃额度，先扣 `estimateTokens(priorSummary)` 再算窗口 | 否则摘要越长、窗口越窄会形成正反馈 |
+| 环节       | 做法                                                                              | 为什么这样选                                                                                                                                                        |
+| ---------- | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| token 估算 | CJK 1 字/token、其他 4 字符/token、每条消息 +4、工具轨迹按 JSON 原文计入          | 不装 tiktoken/gpt-tokenizer：DeepSeek 分词器与 cl100k 并不一致，装一个“精确到别的模型”的库反而给人虚假安全感；这里只需决定“丢多少轮”，±20% 误差只影响窗口边界一两轮 |
+| 滑窗       | `planWindow(messages, budget)` 从最新往回累加，超出即停                           | **最新一条无条件保留**：丢了它本轮请求就没有用户问题，比撞上限更糟                                                                                                  |
+| 摘要       | `SUMMARY_PROMPT` + `completeOnce()` 非流式调用，失败退回抽取式 `extractiveDigest` | 摘要边界 `summaryUntil` 随裁剪一起推进，同一段旧对话不会被反复压缩，也不会既在摘要里又原文重发                                                                      |
+| 工具轨迹   | 不进摘要（它的结论已体现在 assistant 正文里）                                     | 重复计入只会推高压缩成本                                                                                                                                            |
+| 成本控制   | 摘要正文自身也要吃额度，先扣 `estimateTokens(priorSummary)` 再算窗口              | 否则摘要越长、窗口越窄会形成正反馈                                                                                                                                  |
 
 环境变量：`CONTEXT_TOKEN_BUDGET`（默认 6000）、`CONTEXT_SUMMARY_ENABLED`（`false` 则只裁剪不压缩，旧上下文直接退出）。
 
@@ -364,17 +372,17 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 
 策略层 `functions/api/src/memory/memory-policy.ts` 是纯函数（开关、三类上限、归一化与指纹、注入挑选与渲染、编号解析），服务层 `memory.service.ts` 只管读写与淘汰，编排层 `chat/request-context.ts` 只管把它拼进请求。**分成三层同一条理由**：这些判定既要在 Nest 里跑，也要能被评测脚本在没有数据库、没有容器的条件下直接断言。
 
-| 环节 | 做法 | 为什么这样选 |
-|------|------|------|
-| 注入位置 | 独立一条 `system`，顺序为 提示词 → **记忆** → 摘要 → 历史（[request-context.ts:30](file:///D:/MyProject/ai-chat-gitee/functions/api/src/chat/request-context.ts#L30)） | 越靠近历史的部分越该是「这一场对话特有的」：记忆是跨会话的稳定事实，摘要只是本会话早期内容的压缩。合并进提示词那条 `system` 会让版本对比和裁剪口径都变糊 |
-| 为什么不写进历史 | 一律不入库、不入 `messages` | 进了历史就会被滑窗裁剪、被滚动摘要压缩、被用户在前端编辑，还会每轮重复计入 token。评测里「记忆只进 system 段」断言的正是这条 |
-| 写入路径 | 模型 `remember` / 面板手写，共用同一个 `remember()`，只差 `source` | 两份实现必然漂移成「面板里看到的和模型记的不一样」；去重、长度拦截、淘汰也只需写一遍 |
-| 去重 | 归一化（折叠空白 + 转小写）后 sha256，配 `(userId, fingerprint)` 唯一索引；命中就**刷新时间并回原编号** | 归一化让「多打两个空格、大小写不同」不至于记成两条；刷新而不是拒绝，是因为用户重说一遍同一偏好时他的意图是「强调」，不是报错 |
-| 超上限 | 条数超出按 `updatedAt` **淘汰最旧**，而不是拒绝写入 | 刚说的一条新偏好重于半年前的旧习惯；让写入失败只会换来模型反复重试，配额照样花掉 |
-| 注入取舍 | 新→旧取整条，成本按**渲染后整行**（编号 + 正文 + 分隔符）算；被挡掉的条数在文本里如实写「另有 N 条未列出」 | 预算若只按正文算，几十条记忆的编号与换行会悄悄把字符数顶上去。不写「另有 N 条」，模型会以为自己看到了全部，进而断言「你从没说过 X」 |
-| 给模型的编号 | uuid 去连字符后前 8 位，`forget` 允许前缀匹配，前提是在该账号条目里唯一 | 完整 uuid 太长且模型抄错一位就找不到；放宽到前缀的兜底是「不唯一就报歧义并列出候选」，绝不猜一个删掉——误删用户偏好比多花一轮对话严重 |
-| 注入文本的行为约束 | 三句话：本轮明确说法优先 / 冲突时用 `forget` 删过时那条 / 不要复述清单、不要在回答里标编号 | 缺第一条它会拿旧偏好压过用户刚提的要求；缺第二条纠正只能靠用户手动；缺第三条它会把清单原样吐回界面 |
-| 读失败 | `list()` 捕获一切异常退化成「没有记忆」+ 一条 warn | 长期记忆是锦上添花，不该把一次对话钉在「生产库 DDL 还没跑」这种运维步骤上。缺表由 `/api/health` 的 `memoryTable` 与日志暴露 |
+| 环节               | 做法                                                                                                                                                                   | 为什么这样选                                                                                                                                             |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 注入位置           | 独立一条 `system`，顺序为 提示词 → **记忆** → 摘要 → 历史（[request-context.ts:30](file:///D:/MyProject/ai-chat-gitee/functions/api/src/chat/request-context.ts#L30)） | 越靠近历史的部分越该是「这一场对话特有的」：记忆是跨会话的稳定事实，摘要只是本会话早期内容的压缩。合并进提示词那条 `system` 会让版本对比和裁剪口径都变糊 |
+| 为什么不写进历史   | 一律不入库、不入 `messages`                                                                                                                                            | 进了历史就会被滑窗裁剪、被滚动摘要压缩、被用户在前端编辑，还会每轮重复计入 token。评测里「记忆只进 system 段」断言的正是这条                             |
+| 写入路径           | 模型 `remember` / 面板手写，共用同一个 `remember()`，只差 `source`                                                                                                     | 两份实现必然漂移成「面板里看到的和模型记的不一样」；去重、长度拦截、淘汰也只需写一遍                                                                     |
+| 去重               | 归一化（折叠空白 + 转小写）后 sha256，配 `(userId, fingerprint)` 唯一索引；命中就**刷新时间并回原编号**                                                                | 归一化让「多打两个空格、大小写不同」不至于记成两条；刷新而不是拒绝，是因为用户重说一遍同一偏好时他的意图是「强调」，不是报错                             |
+| 超上限             | 条数超出按 `updatedAt` **淘汰最旧**，而不是拒绝写入                                                                                                                    | 刚说的一条新偏好重于半年前的旧习惯；让写入失败只会换来模型反复重试，配额照样花掉                                                                         |
+| 注入取舍           | 新→旧取整条，成本按**渲染后整行**（编号 + 正文 + 分隔符）算；被挡掉的条数在文本里如实写「另有 N 条未列出」                                                             | 预算若只按正文算，几十条记忆的编号与换行会悄悄把字符数顶上去。不写「另有 N 条」，模型会以为自己看到了全部，进而断言「你从没说过 X」                      |
+| 给模型的编号       | uuid 去连字符后前 8 位，`forget` 允许前缀匹配，前提是在该账号条目里唯一                                                                                                | 完整 uuid 太长且模型抄错一位就找不到；放宽到前缀的兜底是「不唯一就报歧义并列出候选」，绝不猜一个删掉——误删用户偏好比多花一轮对话严重                     |
+| 注入文本的行为约束 | 三句话：本轮明确说法优先 / 冲突时用 `forget` 删过时那条 / 不要复述清单、不要在回答里标编号                                                                             | 缺第一条它会拿旧偏好压过用户刚提的要求；缺第二条纠正只能靠用户手动；缺第三条它会把清单原样吐回界面                                                       |
+| 读失败             | `list()` 捕获一切异常退化成「没有记忆」+ 一条 warn                                                                                                                     | 长期记忆是锦上添花，不该把一次对话钉在「生产库 DDL 还没跑」这种运维步骤上。缺表由 `/api/health` 的 `memoryTable` 与日志暴露                              |
 
 环境变量：`MEMORY_ENABLED`（默认 `true`，只认字面 `false`）、`MEMORY_ITEM_MAX_CHARS`（200）、`MEMORY_MAX_ENTRIES`（100）、`MEMORY_INJECT_MAX_CHARS`（1500），三者都有代码内下限兜底。
 `/api/health` 暴露 `memory` / `memoryTable` / `memoryLimits`，线上「到底记没记进去」不重新发布就能查。
@@ -394,16 +402,16 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 
 以前工具卡片只有「执行中 → 突然全文」，一次十几秒的 `fetch_url` 期间界面没有任何反馈，用户分不清是在跑还是卡死。现在工具在执行期间就能推增量。
 
-| 环节 | 做法 | 为什么这样选 |
-|------|------|------|
-| 回调怎么进工具 | `ToolContext.report?: (patch) => void`（[tools.ts:47](file:///D:/MyProject/ai-chat-gitee/functions/api/src/agent/tools.ts#L47)），由 `chat.service` 在每次 `executeTool` 时按该次调用现绑一个闭包，闭包里带着 `tool_call_id` | 工具不该认识 SSE，也不该自己拼事件体；后台执行器与评测脚本走同一条代码路径，只是不传 `report`，工具必须照常跑完（[tools.ts:322](file:///D:/MyProject/ai-chat-gitee/functions/api/src/agent/tools.ts#L322)） |
-| 事件形态 | 三段式 `calling → streaming* → done\|error`；`streaming` 里 `delta` 与 `progress` 可以只有其一 | 「校验第 N 跳地址」「开始接收响应」这类阶段没有正文可推，硬造一个空 `delta` 会让前端多累加一次空串，序列化时干脆不带这个键 |
-| HTML → 纯文本 | `agent/html-text.ts` 的 `HtmlTextStream`：增量喂字节、增量出正文，**任意切分下拼起来与整篇 `htmlToText` 逐字相同** | 这是整个功能成立的前提。抽取结果与切分方式有关，界面就会先长出一段又被终态 `result` 改写，比不流式更糟。跨块的多字节字符用 `TextDecoder({stream:true})`，标签名、实体、`<script>` 块都可能正好被切开 |
-| 谁被抽出来 | 丢弃 `<script>` / `<style>` / 注释，折叠空白与换行，还原 HTML 实体；正文满 `FETCH_TEXT_LIMIT=3000` 字后停止产出并置 `full` | 脚本源码混进正文既污染模型输入又白吃 token；到上限还继续下载只会把带宽花在丢弃的内容上，阶段名会如实变成「正文已读满，停止下载」 |
-| 终态与增量的关系 | 终态 `done` 带**完整** `result`，前端用 `step.result ?? step.delta` 覆盖 | 两边由同一份抽取器产出，所以是同一串文本：覆盖不是改写，用户看不见跳变。缺了这条不变量，累加逻辑就不能这么写 |
-| 多工具交错 | 每个事件都带 `tool_call_id`，前端按 id 归位到对应卡片；一行的「N 个进行中」按未终态计数 | 一轮并发几个工具就有几条独立事件流交错到达，靠事件顺序无法区分是哪张卡的进度 |
-| 界面呈现 | 卡片执行中显示已累加的正文 + 一行量化进度（阶段名、已下载字节/上限、已抽取字数），终态换成完整结果（[ChatInterface.tsx:41](file:///D:/MyProject/ai-chat-gitee/frontend/src/components/ChatInterface.tsx#L41)） | 只写「加载中」等于没写；给出字节与字数，用户才知道慢在哪、还要等多久 |
-| 非 2xx | 目标返回非 2xx 直接判失败，错误文本带状态码 | 错误页也是一段 HTML，抓下来当正文喂给模型，模型会一本正经地总结「502 Bad Gateway 表示……」 |
+| 环节             | 做法                                                                                                                                                                                                                         | 为什么这样选                                                                                                                                                                                                |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 回调怎么进工具   | `ToolContext.report?: (patch) => void`（[tools.ts:47](file:///D:/MyProject/ai-chat-gitee/functions/api/src/agent/tools.ts#L47)），由 `chat.service` 在每次 `executeTool` 时按该次调用现绑一个闭包，闭包里带着 `tool_call_id` | 工具不该认识 SSE，也不该自己拼事件体；后台执行器与评测脚本走同一条代码路径，只是不传 `report`，工具必须照常跑完（[tools.ts:322](file:///D:/MyProject/ai-chat-gitee/functions/api/src/agent/tools.ts#L322)） |
+| 事件形态         | 三段式 `calling → streaming* → done\|error`；`streaming` 里 `delta` 与 `progress` 可以只有其一                                                                                                                               | 「校验第 N 跳地址」「开始接收响应」这类阶段没有正文可推，硬造一个空 `delta` 会让前端多累加一次空串，序列化时干脆不带这个键                                                                                  |
+| HTML → 纯文本    | `agent/html-text.ts` 的 `HtmlTextStream`：增量喂字节、增量出正文，**任意切分下拼起来与整篇 `htmlToText` 逐字相同**                                                                                                           | 这是整个功能成立的前提。抽取结果与切分方式有关，界面就会先长出一段又被终态 `result` 改写，比不流式更糟。跨块的多字节字符用 `TextDecoder({stream:true})`，标签名、实体、`<script>` 块都可能正好被切开        |
+| 谁被抽出来       | 丢弃 `<script>` / `<style>` / 注释，折叠空白与换行，还原 HTML 实体；正文满 `FETCH_TEXT_LIMIT=3000` 字后停止产出并置 `full`                                                                                                   | 脚本源码混进正文既污染模型输入又白吃 token；到上限还继续下载只会把带宽花在丢弃的内容上，阶段名会如实变成「正文已读满，停止下载」                                                                            |
+| 终态与增量的关系 | 终态 `done` 带**完整** `result`，前端用 `step.result ?? step.delta` 覆盖                                                                                                                                                     | 两边由同一份抽取器产出，所以是同一串文本：覆盖不是改写，用户看不见跳变。缺了这条不变量，累加逻辑就不能这么写                                                                                                |
+| 多工具交错       | 每个事件都带 `tool_call_id`，前端按 id 归位到对应卡片；一行的「N 个进行中」按未终态计数                                                                                                                                      | 一轮并发几个工具就有几条独立事件流交错到达，靠事件顺序无法区分是哪张卡的进度                                                                                                                                |
+| 界面呈现         | 卡片执行中显示已累加的正文 + 一行量化进度（阶段名、已下载字节/上限、已抽取字数），终态换成完整结果（[ChatInterface.tsx:41](file:///D:/MyProject/ai-chat-gitee/frontend/src/components/ChatInterface.tsx#L41)）               | 只写「加载中」等于没写；给出字节与字数，用户才知道慢在哪、还要等多久                                                                                                                                        |
+| 非 2xx           | 目标返回非 2xx 直接判失败，错误文本带状态码                                                                                                                                                                                  | 错误页也是一段 HTML，抓下来当正文喂给模型，模型会一本正经地总结「502 Bad Gateway 表示……」                                                                                                                   |
 
 评测 `tool-streaming`（5 项）钉住的就是这几条不变量：三段式每条带 `id`/`name`、切分无关性（8 个样本 × 7 种切分）、抽取口径、上限处停止产出且 delta 累加不超过 `result`、跨块多字节解码。
 
@@ -413,14 +421,14 @@ HTTP 云函数 api（Runtime Nodejs20.19，入口 scf_bootstrap，NestJS 监听 
 
 已交付（`functions/api/src/tasks/`）：
 
-| 部件 | 职责 |
-|------|------|
-| `task.entity.ts` | 队列的持久形状（见「Task」），状态/租约/退避/幂等字段一次配齐 |
-| `task-policy.ts` | 纯函数策略层：状态机 `canTransition`、可领取判定 `isClaimable`、退避 `backoffMs`、失败编排 `planFailure`、文本上限 `clipText`、环境变量读取 |
-| `task-registry.ts` | kind 注册表：有哪些 kind、payload 长什么样、领取后怎么解释 |
-| `task.service.ts` | 面向请求的 CRUD + 面向执行器的 `claimNext` / `renewLease` / `isCanceled` / `report` / `succeed` / `fail` |
-| `tasks.controller.ts` | REST 入口（见「后台任务」） |
-| `agent/tools.ts` 的 `run_in_background` | 让模型自己提交长任务，只回任务编号不回结果 |
+| 部件                                    | 职责                                                                                                                                        |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `task.entity.ts`                        | 队列的持久形状（见「Task」），状态/租约/退避/幂等字段一次配齐                                                                               |
+| `task-policy.ts`                        | 纯函数策略层：状态机 `canTransition`、可领取判定 `isClaimable`、退避 `backoffMs`、失败编排 `planFailure`、文本上限 `clipText`、环境变量读取 |
+| `task-registry.ts`                      | kind 注册表：有哪些 kind、payload 长什么样、领取后怎么解释                                                                                  |
+| `task.service.ts`                       | 面向请求的 CRUD + 面向执行器的 `claimNext` / `renewLease` / `isCanceled` / `report` / `succeed` / `fail`                                    |
+| `tasks.controller.ts`                   | REST 入口（见「后台任务」）                                                                                                                 |
+| `agent/tools.ts` 的 `run_in_background` | 让模型自己提交长任务，只回任务编号不回结果                                                                                                  |
 
 尚未交付：**执行器进程本身**。上面这套领取/续约/回报接口目前没有调用方，因此任务提交后会停在 `queued`。
 
@@ -454,11 +462,11 @@ SYSTEM_PROMPT / SUMMARY_PROMPT 从 service 里抽到 `chat/prompt.ts`，并导�
 
 离线断言吃的是纯函数与编译产物，它**结构上看不见**这几类东西：SSE 帧的真实切分、DTO 装配之后到底返回什么状态码、事务里挪生效指针的实际效果、续传时上游一共收到几次请求。这些原先每次验证都要临时搭一套链路演一遍，脚本用完就删，下次从头再写——三层就是把这件事固定下来：
 
-| 层 | 命令 | 实测 | 证到哪 |
-|---|---|---|---|
-| 静态 | `npm run verify` | 3.8s（同口径串行 8.2s） | 类型、构建、79 项离线不变量、前端构建；前端 lint 跑但只报不判 |
-| 协议 | `npm run verify:live` | 4.9s | 49 项装配后的行为：SSE 顺序与 `[DONE]` 收尾、断线半截落库与续传只补增量、按家校验与生效指针、记忆注入与开关、工具事件带 id、SSRF、明文 Key 不进响应也不进库 |
-| 界面 | 浏览器真点 | — | 文案、空态/错误态、进度条长得对不对；以及「模型会不会自己决定调工具」（`eval:online`） |
+| 层   | 命令                  | 实测                    | 证到哪                                                                                                                                                      |
+| ---- | --------------------- | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 静态 | `npm run verify`      | 3.8s（同口径串行 8.2s） | 类型、构建、79 项离线不变量、前端构建；前端 lint 跑但只报不判                                                                                               |
+| 协议 | `npm run verify:live` | 4.9s                    | 49 项装配后的行为：SSE 顺序与 `[DONE]` 收尾、断线半截落库与续传只补增量、按家校验与生效指针、记忆注入与开关、工具事件带 id、SSRF、明文 Key 不进响应也不进库 |
+| 界面 | 浏览器真点            | —                       | 文案、空态/错误态、进度条长得对不对；以及「模型会不会自己决定调工具」（`eval:online`）                                                                      |
 
 - **`verify:live` 直接 `node` 起 runner，不套一层 npm**：npm 会把 `--only=...` 当成自己的 config（`--only` 还是 npm 的真有选项），根脚本里再套 `npm --prefix ... run eval:live` 时参数根本到不了 `run-live.mjs`——表现是「指定了子集却全跑一遍」且不报错。要跑子集得写成 `npm run verify:live -- --only=chat-core`，而这条能成立的前提是根脚本最后一段就是那条 node 命令。
 - **lint 在静态那层只报不判**：仓库里挂着一条与当次改动无关的既有 eslint 报错（`ChatInterface.tsx` 的 `react-hooks/preserve-manual-memoization`），只要它还在，`npm run verify` 就恒返回 1——一条永远红的命令不能当闸门，否则第一次真回归时没人看得出区别。所以 `scripts/verify.mjs` 把 lint 标成 advisory：照旧并行跑、照旧打完整输出、结果行标 `exit 1（只报不判）`，但不计进退出码；其余四步任一失败仍返回 1。要把 lint 当硬门的地方（比如 CI）单独跑 `npm run lint`，返回码不变。等那条报错修掉，去掉 `advisory: true` 就恢复全判。
@@ -494,17 +502,17 @@ SYSTEM_PROMPT / SUMMARY_PROMPT 从 service 里抽到 `chat/prompt.ts`，并导�
 
 ## 前端模块职责
 
-| 文件 | 职责 |
-|------|------|
-| `frontend/src/client.ts` | 封装所有后端 HTTP/SSE 调用（含 `truncateConversation`、`resumeChat`）；`streamChat` 与 `resumeChat` 共用同一个 `runChatStream`，只有路径和请求体不同，回调统一收进 `ChatStreamHandlers` 对象——`onChunk`/`onNotice` 签名一模一样，再排位置参数就会悄悄接错而 TS 抓不到同类型的顺序错误；流没等到 `[DONE]` 就结束时抛 `ChatStreamError(…, retryable=true)`，把「网关掐流」和「正常写完」区分开；`model` 事件转成 `onModel`，界面据此说明「刚才是哪个模型答的」；`tool` 事件整体转成 `onStep`（含 `delta`/`progress`/`status`），客户端不理解增量语义，只在 App 里合流；长期记忆三个调用 `fetchMemories` / `createMemory` / `deleteMemory`，返回体统一是 `{ items, limits }` 信封（写入也回整份清单：一次写入可能连带淘汰旧条目，只回新增那条会显示成少了一条）；`updatedAt` 在这里收窄成 `number`——后端 `Date` 会序列化成 ISO 串，而 sqljs 与 Postgres 也可能直接给毫秒数，界面只该看到一种；统一管理 token（localStorage）与 `Authorization` 头，任一接口 401 时广播 `ai-chat:unauthorized` 让 App 收回登录态；`fetchAuthMode` 问后端当前是否免登录，拿不到结果就按需要真实登录处理 |
-| `frontend/src/apiConfig.ts` | PROVIDER_PRESETS（给 Modal UI 渲染用，id 与默认值必须和后端 `PROVIDER_REGISTRY` 逐家一致，由 `multi-provider` 断言钉住）、`PROVIDER_ORDER`、表单校验工具（`isHttpsBaseUrl`、`isProviderType` 收窄外部字符串） |
-| `frontend/src/types.ts` | Message / Conversation / ApiConfig / ProviderType 类型；Message 上的 `model` 是本轮实际作答的模型（历史消息从库里读回，只有名字），`modelReason` 只在流式那一轮存在 |
-| `frontend/src/App.tsx` | 状态管理：登录态、会话列表、当前会话、配置状态；首屏先问 `/api/auth/mode`，免登录时直接以返回的身份进入主界面，否则用 token 换登录态，未登录只渲染 `AuthView`；登录后没配 Key 自动弹设置窗；配置状态是一份 `ConfigListResponse`（`configured` / `active` / `items`），保存、切换、删除后统一 `refreshConfigs()` 重取——生效指针由后端决定，前端不自己推断「哪份该显示成当前使用」，弹窗也只在打开时挂载以免留着上次编辑的残值；`rewindTo` 统一承载“重新生成”与“编辑重发”（先改后端再同步本地）；发送链路自带续传循环 `resumeFromBreak`：`generated` 累积本轮已渲染文本，遇到 `retryable` 错误就先等 `online` 再退避重试，把 `generated` 当 `partial` 续写，最多 3 次，耗尽或不可续时保留半截回答并给出明确结尾；`onModel` 把服务端的路由决策写进当前 assistant 气泡（`model` + `modelReason`），续传那轮收到的理由会覆盖首发那轮的，因为「沿用」才是此刻的事实；`pagehide`/卸载时 abort 在途 SSE；`onStep` 按 `tool_call_id` 合流进行中的步骤（同 id 覆盖，新 id 追加），`delta` 只在执行期累加、终态一律以 `result` 为准并把 `delta`/`progress` 清掉——留着会显示两遍；`remember`/`forget` 落到终态时自增 `memoryRevision`，记忆面板据此重拉清单：清单是模型改的，界面只能从工具终态得知，不重取的话用户看不到「它到底记了什么」，也就没机会纠正 |
-| `frontend/src/components/AuthView.tsx` | 登录/注册页：模式切换、前置长度校验、错误提示、提交中禁用按钮 |
-| `frontend/src/components/ChatInterface.tsx` | 纯 UI：侧栏 + 气泡 + 输入框 + Markdown 渲染 + 工具步骤面板；“重新生成”仅给最后一条回答，“编辑重发”仅给历史用户消息；顶栏展示当前账号与「退出登录」（生成中禁用）；那个模型名取**最近一条带模型标记的回答**（没有才退回配置里的主力模型），前面拼上生效那一份的供应商标（`智谱 GLM · glm-air`），一次配多家之后「刚才这句是谁答的」才有主语；气泡下方标出该条自己的模型、悬停给理由——一次会话里不同问题的档位可以不同，逐条标注才答得出「这句是谁说的」；`demoMode` 下账号旁加「免登录」标记并收起退出登录按钮——没有 token 可清，留着按钮只会给出一个点了没反应的入口；工具步骤卡片执行中显示累加正文与一行量化进度（`describeProgress`：阶段名 + 已下载字节/上限 + 已抽取字数），同批多个未完成时标「N 个进行中」，终态换成完整 `result`；顶栏并排挂「后台任务」与「长期记忆」两个抽屉入口 |
-| `frontend/src/components/ApiConfigModal.tsx` | 配置弹窗 UI：**多家并陈**——上半区列出这个账号存过的每一家（「当前使用」徽章 / 「正在编辑」/ 编辑 / 设为使用 / 删除），下半区是所选那一家的 Key、模型、档位候选与 Base URL。Key 框留空即「沿用库里那把」，占位与掩码提示一起写清楚，改模型名不用重贴密钥；「保存后设为当前使用」勾选对应 `apply`，不勾就是先存着、回头再切。保存/切换/删除共用一个 `busy`，否则连点两次「设为使用」会把生效指针翻回前一份；表单初值在挂载时从 props 取一次快照（父组件只在打开时挂载本组件），挂在 effect 里重置会让列表刷新把用户正在编辑的内容一起覆盖掉；错误一律走 `role="alert"` 的中文提示条，不把上游原文抛给用户 |
-| `frontend/src/components/MemoryPanel.tsx` | 「长期记忆」面板（顶栏入口 + 右侧抽屉，由 ChatInterface 挂载）：自拉数据、不向 App 要清单，只接一个 `revision` 作为「模型刚改过」的信号；**不轮询**——清单只会被本浏览器发起的操作改动，定时拉取只会白占按 IP 的限流额度（和聊天接口同一个桶）；每行显示来源徽章（模型记的 / 用户手写的）、`[a1b2c3]` 短编号、更新时间与「忘掉这条」；副标题把当前口径摊开（`最多 N 条 · 单条 M 字`，来自服务端 `limits`，改环境变量后界面跟着变）；空态给出可直接照做的示范话术，读取失败带「重试」，手动补一条时实时校验字数并拦在 `MEMORY_ITEM_MAX_CHARS` 之内 |
-| `frontend/src/components/TaskPanel.tsx` | 后台任务面板（顶栏入口 + 抽屉）：自拉数据、不向 App 要 prop；有活跃任务且抽屉打开时 2s 轮询，否则降到 15s；`runnerEnabled=false` 时明确解释「任务只会排队」；提交表单按 `/api/tasks/meta/kinds` 的字段说明渲染；取消按钮只对进行中的任务出现，终态只展示结果 |
+| 文件                                         | 职责                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `frontend/src/client.ts`                     | 封装所有后端 HTTP/SSE 调用（含 `truncateConversation`、`resumeChat`）；`streamChat` 与 `resumeChat` 共用同一个 `runChatStream`，只有路径和请求体不同，回调统一收进 `ChatStreamHandlers` 对象——`onChunk`/`onNotice` 签名一模一样，再排位置参数就会悄悄接错而 TS 抓不到同类型的顺序错误；流没等到 `[DONE]` 就结束时抛 `ChatStreamError(…, retryable=true)`，把「网关掐流」和「正常写完」区分开；`model` 事件转成 `onModel`，界面据此说明「刚才是哪个模型答的」；`tool` 事件整体转成 `onStep`（含 `delta`/`progress`/`status`），客户端不理解增量语义，只在 App 里合流；长期记忆三个调用 `fetchMemories` / `createMemory` / `deleteMemory`，返回体统一是 `{ items, limits }` 信封（写入也回整份清单：一次写入可能连带淘汰旧条目，只回新增那条会显示成少了一条）；`updatedAt` 在这里收窄成 `number`——后端 `Date` 会序列化成 ISO 串，而 sqljs 与 Postgres 也可能直接给毫秒数，界面只该看到一种；统一管理 token（localStorage）与 `Authorization` 头，任一接口 401 时广播 `ai-chat:unauthorized` 让 App 收回登录态；`fetchAuthMode` 问后端当前是否免登录，拿不到结果就按需要真实登录处理                                                                                                                                                              |
+| `frontend/src/apiConfig.ts`                  | PROVIDER_PRESETS（给 Modal UI 渲染用，id 与默认值必须和后端 `PROVIDER_REGISTRY` 逐家一致，由 `multi-provider` 断言钉住）、`PROVIDER_ORDER`、表单校验工具（`isHttpsBaseUrl`、`isProviderType` 收窄外部字符串）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `frontend/src/types.ts`                      | Message / Conversation / ApiConfig / ProviderType 类型；Message 上的 `model` 是本轮实际作答的模型（历史消息从库里读回，只有名字），`modelReason` 只在流式那一轮存在                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `frontend/src/App.tsx`                       | 状态管理：登录态、会话列表、当前会话、配置状态；首屏先问 `/api/auth/mode`，免登录时直接以返回的身份进入主界面，否则用 token 换登录态，未登录只渲染 `AuthView`；登录后没配 Key 自动弹设置窗；配置状态是一份 `ConfigListResponse`（`configured` / `active` / `items`），保存、切换、删除后统一 `refreshConfigs()` 重取——生效指针由后端决定，前端不自己推断「哪份该显示成当前使用」，弹窗也只在打开时挂载以免留着上次编辑的残值；`rewindTo` 统一承载“重新生成”与“编辑重发”（先改后端再同步本地）；发送链路自带续传循环 `resumeFromBreak`：`generated` 累积本轮已渲染文本，遇到 `retryable` 错误就先等 `online` 再退避重试，把 `generated` 当 `partial` 续写，最多 3 次，耗尽或不可续时保留半截回答并给出明确结尾；`onModel` 把服务端的路由决策写进当前 assistant 气泡（`model` + `modelReason`），续传那轮收到的理由会覆盖首发那轮的，因为「沿用」才是此刻的事实；`pagehide`/卸载时 abort 在途 SSE；`onStep` 按 `tool_call_id` 合流进行中的步骤（同 id 覆盖，新 id 追加），`delta` 只在执行期累加、终态一律以 `result` 为准并把 `delta`/`progress` 清掉——留着会显示两遍；`remember`/`forget` 落到终态时自增 `memoryRevision`，记忆面板据此重拉清单：清单是模型改的，界面只能从工具终态得知，不重取的话用户看不到「它到底记了什么」，也就没机会纠正 |
+| `frontend/src/components/AuthView.tsx`       | 登录/注册页：模式切换、前置长度校验、错误提示、提交中禁用按钮                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `frontend/src/components/ChatInterface.tsx`  | 纯 UI：侧栏 + 气泡 + 输入框 + Markdown 渲染 + 工具步骤面板；“重新生成”仅给最后一条回答，“编辑重发”仅给历史用户消息；顶栏展示当前账号与「退出登录」（生成中禁用）；那个模型名取**最近一条带模型标记的回答**（没有才退回配置里的主力模型），前面拼上生效那一份的供应商标（`智谱 GLM · glm-air`），一次配多家之后「刚才这句是谁答的」才有主语；气泡下方标出该条自己的模型、悬停给理由——一次会话里不同问题的档位可以不同，逐条标注才答得出「这句是谁说的」；`demoMode` 下账号旁加「免登录」标记并收起退出登录按钮——没有 token 可清，留着按钮只会给出一个点了没反应的入口；工具步骤卡片执行中显示累加正文与一行量化进度（`describeProgress`：阶段名 + 已下载字节/上限 + 已抽取字数），同批多个未完成时标「N 个进行中」，终态换成完整 `result`；顶栏并排挂「后台任务」与「长期记忆」两个抽屉入口                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `frontend/src/components/ApiConfigModal.tsx` | 配置弹窗 UI：**多家并陈**——上半区列出这个账号存过的每一家（「当前使用」徽章 / 「正在编辑」/ 编辑 / 设为使用 / 删除），下半区是所选那一家的 Key、模型、档位候选与 Base URL。Key 框留空即「沿用库里那把」，占位与掩码提示一起写清楚，改模型名不用重贴密钥；「保存后设为当前使用」勾选对应 `apply`，不勾就是先存着、回头再切。保存/切换/删除共用一个 `busy`，否则连点两次「设为使用」会把生效指针翻回前一份；表单初值在挂载时从 props 取一次快照（父组件只在打开时挂载本组件），挂在 effect 里重置会让列表刷新把用户正在编辑的内容一起覆盖掉；错误一律走 `role="alert"` 的中文提示条，不把上游原文抛给用户                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `frontend/src/components/MemoryPanel.tsx`    | 「长期记忆」面板（顶栏入口 + 右侧抽屉，由 ChatInterface 挂载）：自拉数据、不向 App 要清单，只接一个 `revision` 作为「模型刚改过」的信号；**不轮询**——清单只会被本浏览器发起的操作改动，定时拉取只会白占按 IP 的限流额度（和聊天接口同一个桶）；每行显示来源徽章（模型记的 / 用户手写的）、`[a1b2c3]` 短编号、更新时间与「忘掉这条」；副标题把当前口径摊开（`最多 N 条 · 单条 M 字`，来自服务端 `limits`，改环境变量后界面跟着变）；空态给出可直接照做的示范话术，读取失败带「重试」，手动补一条时实时校验字数并拦在 `MEMORY_ITEM_MAX_CHARS` 之内                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `frontend/src/components/TaskPanel.tsx`      | 后台任务面板（顶栏入口 + 抽屉）：自拉数据、不向 App 要 prop；有活跃任务且抽屉打开时 2s 轮询，否则降到 15s；`runnerEnabled=false` 时明确解释「任务只会排队」；提交表单按 `/api/tasks/meta/kinds` 的字段说明渲染；取消按钮只对进行中的任务出现，终态只展示结果                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
 ## 扩展方向
 
